@@ -10,6 +10,7 @@ import {
   IdempotencyContext,
 } from '../idempotency/idempotency';
 import { InsufficientCapacityException } from './exceptions';
+import { buildReservationEvent } from '../outbox/outbox';
 
 export interface ReserveCommand {
   programRef: string;
@@ -181,6 +182,26 @@ export class CapacityService {
                 source: conversion.audit.source,
               },
             },
+          },
+        });
+
+        // STEP 5b — outbox: carries this reservation's ledger seq so
+        // treasury can echo it back as an acknowledgement watermark (see
+        // docs/DECISIONS.md ADR-004/005). Same transaction as the ledger
+        // append, so the two can never disagree.
+        const outboxEvent = buildReservationEvent({
+          programRef: cmd.programRef,
+          invoiceRef: cmd.invoiceRef,
+          seq: row.assigned_seq,
+          amount: conversion.amount.toString(),
+          currency: program.currencyCode,
+          occurredAt: cmd.requestedAt,
+        });
+        await tx.outboxMessage.create({
+          data: {
+            topic: outboxEvent.topic,
+            key: outboxEvent.key,
+            payload: outboxEvent.payload as Prisma.InputJsonValue,
           },
         });
 
