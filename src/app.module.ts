@@ -6,6 +6,7 @@ import { AuthModule } from './auth/auth.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { CapacityModule } from './capacity/capacity.module';
 import { OutboxModule } from './outbox/outbox.module';
+import { KafkaModule } from './kafka/kafka.module';
 
 @Module({
   imports: [
@@ -18,6 +19,7 @@ import { OutboxModule } from './outbox/outbox.module';
     AuthModule,
     CapacityModule,
     OutboxModule,
+    KafkaModule,
   ],
 })
 export class AppModule {}

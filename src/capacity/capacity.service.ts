@@ -8,6 +8,7 @@ import {
   claimIdempotencyKey,
   finishIdempotent,
   IdempotencyContext,
+  Tx,
 } from '../idempotency/idempotency';
 import { InsufficientCapacityException } from './exceptions';
 import { buildReservationEvent } from '../outbox/outbox';
@@ -335,6 +336,51 @@ export class CapacityService {
       reservedAmount: program.reservedAmount.toFixed(minorUnits),
       available: program.totalLimit.minus(program.reservedAmount).toFixed(minorUnits),
     };
+  }
+
+  /// Applied by the Kafka consumer for small, incremental treasury-origin
+  /// deltas — same lock/ledger discipline as the API path, different origin
+  /// tag. Runs INSIDE the caller's transaction (the consumer's inbox tx).
+  async applyTreasuryDelta(
+    tx: Tx,
+    event: {
+      program_ref: string;
+      event_id: string;
+      produced_at: string;
+      delta: { amount: string; currency: string; direction: 'RESERVE' | 'RELEASE' };
+    },
+  ): Promise<void> {
+    const program = await tx.program.findUniqueOrThrow({
+      where: { externalRef: event.program_ref },
+    });
+    const [locked] = await tx.$queryRaw<{ id: string }[]>`
+      SELECT id FROM program WHERE id = ${program.id}::uuid FOR NO KEY UPDATE`;
+    if (!locked) throw new NotFoundException('program');
+
+    const signed =
+      event.delta.direction === 'RESERVE' ? event.delta.amount : `-${event.delta.amount}`;
+    const updated = await tx.$queryRaw<
+      { reserved_amount: Prisma.Decimal; total_limit: Prisma.Decimal; assigned_seq: bigint }[]
+    >`
+      UPDATE program SET reserved_amount = reserved_amount + ${signed}::numeric,
+             next_ledger_seq = next_ledger_seq + 1, version = version + 1, updated_at = now()
+       WHERE id = ${program.id}::uuid
+      RETURNING reserved_amount, total_limit, (next_ledger_seq - 1) AS assigned_seq
+    `;
+    const row = updated[0];
+    await tx.capacityLedgerEntry.create({
+      data: {
+        programId: program.id,
+        seq: row.assigned_seq,
+        entryType: event.delta.direction,
+        origin: 'TREASURY',
+        deltaReserved: signed,
+        balanceReservedAfter: row.reserved_amount,
+        balanceLimitAfter: row.total_limit,
+        occurredAt: new Date(event.produced_at),
+        eventId: event.event_id,
+      },
+    });
   }
 
   /// minorUnits pins the output to the programme currency's scale (e.g.
