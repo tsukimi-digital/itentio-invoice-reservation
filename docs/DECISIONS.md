@@ -53,6 +53,19 @@ than calling the global `Decimal.set()`, which would otherwise also change how
 Prisma itself deserialises query results. API responses emit amounts as JSON
 strings (`"1234.56"`), never numbers, because JSON numbers are IEEE-754 doubles.
 
+**Enforced formatting rule, found the hard way:** raw `Prisma.Decimal#toString()`
+does *not* preserve trailing zeros — a reservation of exactly `30.00` GBP
+came back as `"30"` the first time this was wired up, discovered by manually
+exercising the reserve endpoint against a real database rather than trusting
+the mocked unit test. Every money field returned in an HTTP response body is
+formatted with `.toFixed(minorUnits)` — via `Money#toString()` in the domain
+layer, or explicitly at the boundary (`CapacityService.toView()`,
+`getAvailability()`) wherever a raw `Prisma.Decimal` is read directly from a
+query result. Bare `.toString()` on a `Decimal` still appears internally —
+feeding `Dec` arithmetic in the reconciliation worker, or in ledger-entry
+`metadata`/discrepancy `detail` JSON, neither of which any endpoint currently
+exposes — but is never used for a value that reaches an API response.
+
 ## ADR-002: Locale — UK market, `en-GB` separators
 
 **Context:** The service targets the UK market. `en-GB` uses `.` as the decimal
@@ -143,6 +156,16 @@ a `40001` retry the application would have to handle anyway.
 it doesn't conflict with the `FOR KEY SHARE` lock Postgres takes for FK checks
 on every `invoice`/`capacity_ledger_entry` insert, so those aren't serialized
 behind reservations unnecessarily.
+
+**Scope note:** this applies to every lock taken on `program`/`invoice` rows
+for a capacity mutation — verified with `grep -rn "FOR UPDATE" src/`, every
+match reads `FOR NO KEY UPDATE` except one. The one exception,
+`ReconciliationWorker.claimNextJob()`'s `SELECT ... FOR UPDATE SKIP LOCKED` on
+`reconciliation_job`, is a different, unrelated pattern — a job-queue claim
+(a worker grabbing the next unclaimed row, skipping rows other workers
+already hold), not a capacity-row mutation, so the FK-contention rationale
+above doesn't apply there and a full `FOR UPDATE` is the correct, standard
+idiom for that use case.
 
 ## ADR-007 / ADR-008: At-least-once Kafka, and why the consumer never applies a snapshot inline
 
@@ -252,3 +275,48 @@ topology) rather than for a locally-run demonstration of the core domain.
 
 **Consequences:** Explicitly named here so a reviewer sees they were
 considered and consciously deferred, not missed.
+
+## ADR-013: The Kafka consumer self-provisions its topic
+
+**Context:** A consumer `subscribe()`-ing to a topic nothing has ever
+produced to races the broker's auto-create and throws an uncaught (though
+technically "retriable") `KafkaJSProtocolError: UNKNOWN_TOPIC_OR_PARTITION`.
+In a real deployment, the treasury system would own and provision
+`treasury.capacity-events` out-of-band (Terraform, an admin script). Locally,
+nothing does — and this broke `app.init()` for the first e2e spec that loaded
+the full `AppModule` after the Kafka consumer was added, not just a
+throwaway test script.
+
+**Decision:** `CapacityConsumerService.onModuleInit()` calls
+`kafka.admin().createTopics(...)` for its topic before subscribing, catching
+and logging (not throwing on) any error. `createTopics` is idempotent — a
+no-op if the topic already exists — so this is always safe to run, including
+against a treasury-managed topic in a real deployment.
+
+**Alternatives rejected:** Requiring the topic to be created out-of-band
+before first run — correct for production, but leaves the service unable to
+start cleanly from a freshly reset local environment (`docker compose down
+-v && docker compose up`) without a manual step, which conflicts with the
+assignment's "runnable locally" requirement.
+
+**Consequences:** Verified by fully resetting the local Kafka container (zero
+pre-existing topics) and confirming the full test suite still passes from
+that clean state.
+
+## ADR-014: CI runs both Postgres and Kafka services
+
+**Context:** Once `KafkaModule` (and later `ReconciliationModule`) joined
+`AppModule`, any e2e spec that boots the full app — not just Kafka-specific
+tests — requires a reachable Kafka broker at startup, because
+`CapacityConsumerService.onModuleInit()` connects unconditionally.
+
+**Decision:** `.github/workflows/ci.yml` runs a `kafka` service alongside
+`postgres`, using the exact same single-node KRaft configuration as
+`docker-compose.yml`, so CI matches local dev exactly rather than drifting
+into a second, subtly different configuration to maintain.
+
+**Consequences:** A CI config that only added a Postgres service (the
+initially obvious fix) would have left `capacity.e2e-spec.ts` failing to
+bootstrap in CI even though it passes locally — a reminder that adding a
+module to `AppModule` can silently expand what every full-app-boot test
+needs, not just the tests written for that module.
