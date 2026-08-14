@@ -34,3 +34,8 @@ yarn-error.log*
 
 # prisma
 /prisma/migrations/dev.db*
+
+# locally installed agent skills (research/authoring aid, not shipped code)
+/.agents
+/.claude/skills
+/skills-lock.json
