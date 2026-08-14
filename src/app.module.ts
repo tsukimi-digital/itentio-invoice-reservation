@@ -7,6 +7,7 @@ import { PrismaModule } from './prisma/prisma.module';
 import { CapacityModule } from './capacity/capacity.module';
 import { OutboxModule } from './outbox/outbox.module';
 import { KafkaModule } from './kafka/kafka.module';
+import { ReconciliationModule } from './reconciliation/reconciliation.module';
 
 @Module({
   imports: [
@@ -20,6 +21,7 @@ import { KafkaModule } from './kafka/kafka.module';
     CapacityModule,
     OutboxModule,
     KafkaModule,
+    ReconciliationModule,
   ],
 })
 export class AppModule {}
