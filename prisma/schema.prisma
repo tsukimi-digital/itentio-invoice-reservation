@@ -1,6 +1,3 @@
-// Domain models are introduced in the next step. This file currently pins the
-// datasource and client generator so `prisma generate` runs in CI from day one.
-
 generator client {
   provider = "prisma-client-js"
 }
@@ -8,4 +5,353 @@ generator client {
 datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
+}
+
+// Money columns: numeric(24,4). Scale 4 covers every live ISO-4217 minor-unit
+// exponent (0/2/3/4) with one column type — see docs/DECISIONS.md ADR-001.
+// Rate columns: numeric(24,12) — see ADR-010.
+
+enum ProgramStatus {
+  ACTIVE
+  SUSPENDED
+  CLOSED
+}
+
+enum InvoiceStatus {
+  REGISTERED
+  RESERVED
+  RELEASED
+  CANCELLED
+}
+
+enum LedgerEntryType {
+  RESERVE
+  RELEASE
+  LIMIT_INCREASE
+  LIMIT_DECREASE
+  RECONCILE_BASELINE
+  MANUAL_ADJUSTMENT
+}
+
+enum LedgerOrigin {
+  API
+  TREASURY
+  RECONCILIATION
+  SYSTEM
+}
+
+enum FxRateSource {
+  SEED
+  IDENTITY
+  ECB
+  TREASURY
+}
+
+enum IdempotencyStatus {
+  IN_FLIGHT
+  COMPLETED
+  FAILED
+}
+
+enum ReconciliationStatus {
+  PENDING
+  CLAIMED
+  BASELINE_APPLIED
+  POSITIONS_SYNCED
+  DONE
+  SUPERSEDED
+  FAILED
+}
+
+enum UserRole {
+  ADMIN
+  OPERATOR
+  READER
+}
+
+model Currency {
+  code       String @id @db.Char(3)
+  minorUnits Int    @map("minor_units")
+  name       String @db.VarChar(64)
+
+  programs       Program[]
+  invoices       Invoice[]
+  fxRatesAsBase  FxRate[] @relation("FxBase")
+  fxRatesAsQuote FxRate[] @relation("FxQuote")
+
+  @@map("currency")
+}
+
+model Program {
+  id          String        @id @default(uuid()) @db.Uuid
+  externalRef String        @unique @map("external_ref") @db.VarChar(64)
+  name        String        @db.VarChar(200)
+  status      ProgramStatus @default(ACTIVE)
+
+  currencyCode String   @map("currency_code") @db.Char(3)
+  currency     Currency @relation(fields: [currencyCode], references: [code])
+
+  totalLimit     Decimal @map("total_limit")     @db.Decimal(24, 4)
+  reservedAmount Decimal @map("reserved_amount") @default(0) @db.Decimal(24, 4)
+
+  overCommitAcknowledged Boolean @default(false) @map("over_commit_acknowledged")
+  nextLedgerSeq          BigInt  @default(1)     @map("next_ledger_seq")
+
+  treasurySnapshotSeq      BigInt?   @map("treasury_snapshot_seq")
+  treasuryBaselineAsOf     DateTime? @map("treasury_baseline_as_of") @db.Timestamptz(6)
+  treasuryAckedLocalSeq    BigInt?   @map("treasury_acked_local_seq")
+  treasuryIncludedEventSeq BigInt?   @map("treasury_included_event_seq")
+
+  version Int @default(0)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt      @map("updated_at") @db.Timestamptz(6)
+
+  invoices           Invoice[]
+  ledgerEntries      CapacityLedgerEntry[]
+  reconciliationJobs ReconciliationJob[]
+
+  @@index([status])
+  @@map("program")
+}
+
+model Invoice {
+  id        String  @id @default(uuid()) @db.Uuid
+  programId String  @map("program_id") @db.Uuid
+  program   Program @relation(fields: [programId], references: [id])
+
+  externalRef String        @map("external_ref") @db.VarChar(64)
+  status      InvoiceStatus @default(REGISTERED)
+
+  faceAmount   Decimal  @map("face_amount") @db.Decimal(24, 4)
+  currencyCode String   @map("currency_code") @db.Char(3)
+  currency     Currency @relation(fields: [currencyCode], references: [code])
+
+  reservedProgramAmount Decimal? @map("reserved_program_amount") @db.Decimal(24, 4)
+
+  fxRateId     String?       @map("fx_rate_id") @db.Uuid
+  fxRate       Decimal?      @map("fx_rate") @db.Decimal(24, 12)
+  fxRateSource FxRateSource? @map("fx_rate_source")
+  fxRateAsOf   DateTime?     @map("fx_rate_as_of") @db.Timestamptz(6)
+  fxInverted   Boolean       @default(false) @map("fx_inverted")
+  fxPivot      String?       @map("fx_pivot") @db.Char(3)
+  fxRateRef    FxRate?       @relation(fields: [fxRateId], references: [id])
+
+  treasuryRef     String?   @map("treasury_ref") @db.VarChar(64)
+  treasuryAckedAt DateTime? @map("treasury_acked_at") @db.Timestamptz(6)
+
+  reservedAt DateTime? @map("reserved_at") @db.Timestamptz(6)
+  releasedAt DateTime? @map("released_at") @db.Timestamptz(6)
+  version    Int       @default(0)
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt  DateTime  @updatedAt      @map("updated_at") @db.Timestamptz(6)
+
+  ledgerEntries CapacityLedgerEntry[]
+
+  @@unique([programId, externalRef])
+  @@index([programId, status])
+  @@index([treasuryRef])
+  @@map("invoice")
+}
+
+model CapacityLedgerEntry {
+  id        String  @id @default(uuid()) @db.Uuid
+  programId String  @map("program_id") @db.Uuid
+  program   Program @relation(fields: [programId], references: [id])
+
+  seq BigInt
+
+  entryType LedgerEntryType @map("entry_type")
+  origin    LedgerOrigin
+
+  deltaReserved Decimal @map("delta_reserved") @default(0) @db.Decimal(24, 4)
+  deltaLimit    Decimal @map("delta_limit")    @default(0) @db.Decimal(24, 4)
+
+  balanceReservedAfter Decimal @map("balance_reserved_after") @db.Decimal(24, 4)
+  balanceLimitAfter    Decimal @map("balance_limit_after")    @db.Decimal(24, 4)
+
+  invoiceId String?  @map("invoice_id") @db.Uuid
+  invoice   Invoice? @relation(fields: [invoiceId], references: [id])
+
+  occurredAt DateTime @map("occurred_at") @db.Timestamptz(6)
+  recordedAt DateTime @default(now())     @map("recorded_at") @db.Timestamptz(6)
+
+  treasuryEventSeq BigInt? @map("treasury_event_seq")
+  eventId          String? @unique @map("event_id") @db.VarChar(64)
+  idempotencyKeyId String? @map("idempotency_key_id") @db.Uuid
+  correlationId    String? @map("correlation_id") @db.VarChar(64)
+  metadata         Json?   @db.JsonB
+
+  @@unique([programId, seq])
+  @@index([programId, origin, seq])
+  @@index([programId, recordedAt])
+  @@index([invoiceId])
+  @@map("capacity_ledger_entry")
+}
+
+/// Canonical direction: amount_in_quote = amount_in_base * rate.
+/// e.g. base=EUR quote=USD rate=1.0865 => 1 EUR = 1.0865 USD.
+model FxRate {
+  id String @id @default(uuid()) @db.Uuid
+
+  baseCurrencyCode  String   @map("base_currency_code") @db.Char(3)
+  quoteCurrencyCode String   @map("quote_currency_code") @db.Char(3)
+  baseCurrency      Currency @relation("FxBase",  fields: [baseCurrencyCode],  references: [code])
+  quoteCurrency     Currency @relation("FxQuote", fields: [quoteCurrencyCode], references: [code])
+
+  rate   Decimal      @db.Decimal(24, 12)
+  source FxRateSource @default(SEED)
+
+  asOf       DateTime  @db.Timestamptz(6)
+  validUntil DateTime? @map("valid_until") @db.Timestamptz(6)
+  ingestedAt DateTime  @default(now()) @map("ingested_at") @db.Timestamptz(6)
+
+  invoices Invoice[]
+
+  @@unique([baseCurrencyCode, quoteCurrencyCode, source, asOf])
+  @@index([baseCurrencyCode, quoteCurrencyCode, asOf(sort: Desc)])
+  @@map("fx_rate")
+}
+
+model ProcessedMessage {
+  id String @id @default(uuid()) @db.Uuid
+
+  eventId       String @unique @map("event_id") @db.VarChar(64)
+  topic         String @db.VarChar(200)
+  partition     Int
+  offset        BigInt
+  eventType     String  @map("event_type") @db.VarChar(80)
+  programRef    String? @map("program_ref") @db.VarChar(64)
+  payloadHash   String  @map("payload_hash") @db.Char(64)
+  schemaVersion Int     @map("schema_version")
+
+  receivedAt  DateTime  @default(now()) @map("received_at") @db.Timestamptz(6)
+  processedAt DateTime? @map("processed_at") @db.Timestamptz(6)
+
+  @@unique([topic, partition, offset])
+  @@index([receivedAt])
+  @@map("processed_message")
+}
+
+model DeadLetterMessage {
+  id             String   @id @default(uuid()) @db.Uuid
+  eventId        String?  @map("event_id") @db.VarChar(64)
+  topic          String   @db.VarChar(200)
+  partition      Int
+  offset         BigInt
+  keyText        String?  @map("key_text") @db.VarChar(256)
+  payload        Json     @db.JsonB
+  headers        Json     @db.JsonB
+  errorClass     String   @map("error_class") @db.VarChar(120)
+  errorMessage   String   @map("error_message")
+  attempts       Int      @default(1)
+  publishedToDlq Boolean  @default(false) @map("published_to_dlq")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  resolvedAt     DateTime? @map("resolved_at") @db.Timestamptz(6)
+
+  @@index([topic, createdAt])
+  @@map("dead_letter_message")
+}
+
+model ReconciliationJob {
+  id        String   @id @default(uuid()) @db.Uuid
+  programId String?  @map("program_id") @db.Uuid
+  program   Program? @relation(fields: [programId], references: [id])
+
+  programRef  String   @map("program_ref") @db.VarChar(64)
+  snapshotId  String   @unique @map("snapshot_id") @db.VarChar(64)
+  snapshotSeq BigInt   @map("snapshot_seq")
+  asOf        DateTime @db.Timestamptz(6)
+
+  chunkCount     Int @map("chunk_count") @default(1)
+  chunksReceived Int @map("chunks_received") @default(0)
+  positionCount  Int @map("position_count") @default(0)
+
+  status      ReconciliationStatus @default(PENDING)
+  attempts    Int      @default(0)
+  availableAt DateTime @default(now()) @map("available_at") @db.Timestamptz(6)
+  claimedAt   DateTime? @map("claimed_at") @db.Timestamptz(6)
+  claimedBy   String?   @map("claimed_by") @db.VarChar(80)
+
+  positionCursor String? @map("position_cursor") @db.VarChar(64)
+
+  header      Json      @db.JsonB
+  lastError   String?
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  completedAt DateTime? @map("completed_at") @db.Timestamptz(6)
+
+  positions ReconciliationSnapshotPosition[]
+
+  @@index([status, availableAt])
+  @@index([programRef, snapshotSeq])
+  @@map("reconciliation_job")
+}
+
+model ReconciliationSnapshotPosition {
+  id    String            @id @default(uuid()) @db.Uuid
+  jobId String            @map("job_id") @db.Uuid
+  job   ReconciliationJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  invoiceRef     String   @map("invoice_ref") @db.VarChar(64)
+  localLedgerSeq BigInt?  @map("local_ledger_seq")
+  reservedAmount Decimal  @map("reserved_amount") @db.Decimal(24, 4)
+  currencyCode   String   @map("currency_code") @db.Char(3)
+  statusText     String   @map("status_text") @db.VarChar(40)
+  occurredAt     DateTime @map("occurred_at") @db.Timestamptz(6)
+
+  @@unique([jobId, invoiceRef])
+  @@map("reconciliation_snapshot_position")
+}
+
+model ReconciliationDiscrepancy {
+  id         String   @id @default(uuid()) @db.Uuid
+  jobId      String   @map("job_id") @db.Uuid
+  programId  String   @map("program_id") @db.Uuid
+  kind       String   @db.VarChar(60)
+  invoiceRef String?  @map("invoice_ref") @db.VarChar(64)
+  expected   Decimal? @db.Decimal(24, 4)
+  actual     Decimal? @db.Decimal(24, 4)
+  detail     Json     @db.JsonB
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([programId, createdAt])
+  @@map("reconciliation_discrepancy")
+}
+
+model IdempotencyKey {
+  id String @id @default(uuid()) @db.Uuid
+
+  clientId String @map("client_id") @db.VarChar(64)
+  key      String @db.VarChar(255)
+  method   String @db.VarChar(10)
+  path     String @db.VarChar(255)
+
+  requestHash String @map("request_hash") @db.Char(64)
+
+  status         IdempotencyStatus @default(IN_FLIGHT)
+  responseStatus Int?              @map("response_status")
+  responseBody   Json?             @map("response_body") @db.JsonB
+  resourceId     String?           @map("resource_id") @db.Uuid
+
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  completedAt DateTime? @map("completed_at") @db.Timestamptz(6)
+  expiresAt   DateTime  @map("expires_at") @db.Timestamptz(6)
+
+  @@unique([clientId, key])
+  @@index([expiresAt])
+  @@map("idempotency_key")
+}
+
+model User {
+  id           String   @id @default(uuid()) @db.Uuid
+  email        String   @unique @db.VarChar(255)
+  passwordHash String   @map("password_hash") @db.VarChar(255)
+  displayName  String   @map("display_name") @db.VarChar(120)
+  role         UserRole @default(READER)
+  isActive     Boolean  @default(true) @map("is_active")
+  tokenVersion Int      @default(0) @map("token_version")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  lastLoginAt  DateTime? @map("last_login_at") @db.Timestamptz(6)
+
+  @@map("user")
 }
