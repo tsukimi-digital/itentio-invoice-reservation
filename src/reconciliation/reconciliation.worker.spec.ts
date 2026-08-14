@@ -1,4 +1,4 @@
-import { computeBaseline } from './reconciliation.worker';
+import { computeBaseline, nextCursor } from './reconciliation.worker';
 import { Dec } from '../money/decimal';
 
 describe('computeBaseline', () => {
@@ -19,5 +19,17 @@ describe('computeBaseline', () => {
       localReservedBefore: new Dec('100.00'),
     });
     expect(result.baselineDelta.toString()).toBe('0');
+  });
+});
+
+describe('syncPositions cursor logic', () => {
+  it('advances the cursor to the last processed invoiceRef in a page', () => {
+    // Pure logic extracted for testability — see nextCursor below.
+    const page = [{ invoiceRef: 'INV-001' }, { invoiceRef: 'INV-002' }, { invoiceRef: 'INV-003' }];
+    expect(nextCursor(page)).toBe('INV-003');
+  });
+
+  it('returns null for an empty page (job complete)', () => {
+    expect(nextCursor([])).toBeNull();
   });
 });

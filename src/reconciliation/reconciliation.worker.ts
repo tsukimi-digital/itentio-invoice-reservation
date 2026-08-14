@@ -24,6 +24,10 @@ interface JobHeader {
   program_currency: string;
 }
 
+export function nextCursor(page: { invoiceRef: string }[]): string | null {
+  return page.length === 0 ? null : page[page.length - 1].invoiceRef;
+}
+
 /// See docs/DECISIONS.md ADR-004/005 (baseline+replay, bidirectional
 /// acknowledgement watermark) and ADR-011 (overcommit after reconciliation
 /// is flagged, never clamped).
@@ -51,7 +55,23 @@ export class ReconciliationWorker implements OnModuleInit, OnModuleDestroy {
       // status to CLAIMED before this row was returned, so job.status here is
       // always 'CLAIMED' and cannot be used to decide which phase to run.
       if (job.priorStatus === 'PENDING') await this.applyBaseline(job);
-      // Position sync (Task 12) is wired in here once implemented.
+      const refreshed = await this.prisma.reconciliationJob.findUniqueOrThrow({
+        where: { id: job.id },
+      });
+      // A job reaches this point via two different routes, and both must
+      // trigger position sync: (a) applyBaseline just ran in THIS tick and
+      // moved it PENDING -> BASELINE_APPLIED (refreshed.status reflects
+      // that), or (b) the job ARRIVED already BASELINE_APPLIED from an
+      // earlier tick — e.g. position sync was interrupted by a restart and
+      // resumed via claimNextJob picking it up again. In case (b),
+      // claimNextJob's own claim already stamped refreshed.status to
+      // 'CLAIMED', so only job.priorStatus still remembers where it came
+      // from. Checking refreshed.status alone (as an earlier draft did)
+      // silently drops every resumed job — caught by a smoke test that
+      // seeded a job directly at BASELINE_APPLIED.
+      if (refreshed.status === 'BASELINE_APPLIED' || job.priorStatus === 'BASELINE_APPLIED') {
+        await this.syncPositions(refreshed);
+      }
     } catch (err) {
       this.logger.error(`Reconciliation job ${job.id} failed: ${(err as Error).message}`);
       await this.prisma.reconciliationJob.update({
@@ -217,5 +237,85 @@ export class ReconciliationWorker implements OnModuleInit, OnModuleDestroy {
       },
       { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted, timeout: 15_000 },
     );
+  }
+
+  /// The capacity number is already correct and durable after applyBaseline;
+  /// this phase only reconciles per-invoice attribution and emits
+  /// discrepancies, so it can safely be interrupted and resumed via
+  /// positionCursor — no transaction here spans more than one bounded chunk.
+  private async syncPositions(job: {
+    id: string;
+    programId: string | null;
+    positionCursor: string | null;
+  }): Promise<void> {
+    const CHUNK = 500;
+    let cursor = job.positionCursor;
+    // programId is stamped by applyBaseline before status ever reaches
+    // BASELINE_APPLIED (see Task 11), so this is never null in practice —
+    // the guard exists because the Prisma column is nullable.
+    if (!job.programId) {
+      throw new Error(`reconciliation job ${job.id} has no programId — baseline must run first`);
+    }
+    const programId = job.programId;
+
+    for (;;) {
+      const done = await this.prisma.$transaction(
+        async (tx) => {
+          const page = await tx.reconciliationSnapshotPosition.findMany({
+            where: { jobId: job.id, ...(cursor ? { invoiceRef: { gt: cursor } } : {}) },
+            orderBy: { invoiceRef: 'asc' },
+            take: CHUNK,
+          });
+          if (page.length === 0) return true;
+
+          for (const pos of page) {
+            const invoice = await tx.invoice.findFirst({ where: { externalRef: pos.invoiceRef } });
+            if (!invoice) {
+              await tx.reconciliationDiscrepancy.create({
+                data: {
+                  jobId: job.id,
+                  programId,
+                  kind: 'UNKNOWN_INVOICE',
+                  invoiceRef: pos.invoiceRef,
+                  detail: { snapshotAmount: pos.reservedAmount.toString() },
+                },
+              });
+              continue;
+            }
+            if (
+              invoice.status === 'RESERVED' &&
+              invoice.reservedProgramAmount?.toString() !== pos.reservedAmount.toString()
+            ) {
+              await tx.reconciliationDiscrepancy.create({
+                data: {
+                  jobId: job.id,
+                  programId,
+                  kind: 'AMOUNT_DRIFT',
+                  invoiceRef: pos.invoiceRef,
+                  expected: pos.reservedAmount,
+                  actual: invoice.reservedProgramAmount,
+                  detail: { snapshotCurrency: pos.currencyCode, invoiceStatus: invoice.status },
+                },
+              });
+            }
+          }
+
+          cursor = nextCursor(page);
+          await tx.reconciliationJob.update({
+            where: { id: job.id },
+            data: { positionCursor: cursor },
+          });
+          return page.length < CHUNK;
+        },
+        { timeout: 15_000 },
+      );
+
+      if (done) break;
+    }
+
+    await this.prisma.reconciliationJob.update({
+      where: { id: job.id },
+      data: { status: 'DONE', completedAt: new Date() },
+    });
   }
 }
