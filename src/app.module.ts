@@ -3,6 +3,8 @@ import { ConfigModule } from '@nestjs/config';
 import { validateEnv } from './config/env.schema';
 import { HealthModule } from './health/health.module';
 import { AuthModule } from './auth/auth.module';
+import { PrismaModule } from './prisma/prisma.module';
+import { CapacityModule } from './capacity/capacity.module';
 
 @Module({
   imports: [
@@ -10,8 +12,10 @@ import { AuthModule } from './auth/auth.module';
       isGlobal: true,
       validate: validateEnv,
     }),
+    PrismaModule,
     HealthModule,
     AuthModule,
+    CapacityModule,
   ],
 })
 export class AppModule {}
