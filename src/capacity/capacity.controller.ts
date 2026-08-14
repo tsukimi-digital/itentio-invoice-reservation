@@ -2,6 +2,7 @@ import { Body, Controller, Param, Post } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { CapacityService } from './capacity.service';
 import { ReserveDto } from './dto/reserve.dto';
+import { ReleaseDto } from './dto/release.dto';
 import { IdempotencyCtx } from '../idempotency/idempotency-key.decorator';
 import type { IdempotencyContext } from '../idempotency/idempotency';
 
@@ -28,5 +29,15 @@ export class CapacityController {
       },
       idem,
     );
+  }
+
+  @Post('release')
+  @ApiOperation({ summary: 'Release a program reservation on invoice repayment' })
+  release(
+    @Param('programRef') programRef: string,
+    @Body() dto: ReleaseDto,
+    @IdempotencyCtx() idem: IdempotencyContext,
+  ) {
+    return this.capacity.release({ programRef, invoiceRef: dto.invoiceRef }, idem);
   }
 }

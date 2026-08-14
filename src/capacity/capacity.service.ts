@@ -19,6 +19,11 @@ export interface ReserveCommand {
   requestedAt: Date;
 }
 
+export interface ReleaseCommand {
+  programRef: string;
+  invoiceRef: string;
+}
+
 export interface InvoiceView {
   invoiceId: string;
   invoiceRef: string;
@@ -200,6 +205,91 @@ export class CapacityService {
         // money move: a crash in between is impossible, so a replay can
         // never re-execute.
         return finishIdempotent(tx, idem, this.toView(finalInvoice, targetCurrency.minorUnits));
+      }, TX_OPTS),
+    );
+  }
+
+  async release(cmd: ReleaseCommand, idem: IdempotencyContext): Promise<unknown> {
+    const program = await this.prisma.program.findUniqueOrThrow({
+      where: { externalRef: cmd.programRef },
+      include: { currency: true },
+    });
+
+    return withRetry(() =>
+      this.prisma.$transaction(async (tx) => {
+        await tx.$executeRawUnsafe(`SET LOCAL lock_timeout = '3s'`);
+
+        const claim = await claimIdempotencyKey(tx, idem);
+        if (claim.kind === 'replay') return claim.storedResponse;
+        if (claim.kind === 'conflict') {
+          throw new ConflictException('Idempotency-Key reused with a different request body');
+        }
+
+        const [locked] = await tx.$queryRaw<{ id: string; status: string }[]>`
+          SELECT id, status FROM program WHERE id = ${program.id}::uuid FOR NO KEY UPDATE`;
+        if (!locked) throw new NotFoundException('program');
+
+        const [invoice] = await tx.$queryRaw<
+          { id: string; status: string; reserved_program_amount: Prisma.Decimal | null }[]
+        >`
+          SELECT id, status, reserved_program_amount FROM invoice
+           WHERE program_id = ${program.id}::uuid AND external_ref = ${cmd.invoiceRef} FOR NO KEY UPDATE`;
+        if (!invoice) throw new NotFoundException('invoice');
+
+        if (invoice.status === 'RELEASED') {
+          return finishIdempotent(tx, idem, {
+            invoiceId: invoice.id,
+            invoiceRef: cmd.invoiceRef,
+            status: 'RELEASED',
+          });
+        }
+        if (invoice.status !== 'RESERVED')
+          throw new ConflictException(`invoice is ${invoice.status}`);
+
+        // EXACTLY the amount that was reserved — never recomputed at today's
+        // rate. See docs/DECISIONS.md ADR-003: this is what makes capacity
+        // return to precisely its prior level.
+        const amount = invoice.reserved_program_amount!;
+
+        const updated = await tx.$queryRaw<
+          { reserved_amount: Prisma.Decimal; total_limit: Prisma.Decimal; assigned_seq: bigint }[]
+        >`
+          UPDATE program
+             SET reserved_amount = reserved_amount - ${amount.toString()}::numeric,
+                 next_ledger_seq = next_ledger_seq + 1, version = version + 1, updated_at = now()
+           WHERE id = ${program.id}::uuid AND reserved_amount - ${amount.toString()}::numeric >= 0
+          RETURNING reserved_amount, total_limit, (next_ledger_seq - 1) AS assigned_seq
+        `;
+        if (updated.length === 0) {
+          throw new ConflictException(
+            'materialised balance would go negative — data integrity issue',
+          );
+        }
+        const row = updated[0];
+
+        await tx.capacityLedgerEntry.create({
+          data: {
+            programId: program.id,
+            seq: row.assigned_seq,
+            entryType: 'RELEASE',
+            origin: 'API',
+            deltaReserved: amount.negated().toString(),
+            deltaLimit: 0,
+            balanceReservedAfter: row.reserved_amount,
+            balanceLimitAfter: row.total_limit,
+            invoiceId: invoice.id,
+            occurredAt: new Date(),
+            idempotencyKeyId: idem.rowId,
+            eventId: randomUUID(),
+          },
+        });
+
+        const finalInvoice = await tx.invoice.update({
+          where: { id: invoice.id },
+          data: { status: 'RELEASED', releasedAt: new Date(), version: { increment: 1 } },
+        });
+
+        return finishIdempotent(tx, idem, this.toView(finalInvoice, program.currency.minorUnits));
       }, TX_OPTS),
     );
   }

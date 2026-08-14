@@ -81,3 +81,40 @@ describe('CapacityService.reserve', () => {
     ).rejects.toThrow(InsufficientCapacityException);
   });
 });
+
+describe('CapacityService.release', () => {
+  it('is idempotent — releasing an already-released invoice is a no-op', async () => {
+    const queryRaw = jest
+      .fn()
+      .mockResolvedValueOnce([{ id: 'p1', status: 'ACTIVE' }])
+      .mockResolvedValueOnce([
+        { id: 'inv1', status: 'RELEASED', reserved_program_amount: new Dec('10') },
+      ]);
+    const tx = {
+      $executeRawUnsafe: jest.fn(),
+      $executeRaw: jest.fn().mockResolvedValue(1),
+      $queryRaw: queryRaw,
+      idempotencyKey: { findUniqueOrThrow: jest.fn(), update: jest.fn().mockResolvedValue({}) },
+    };
+    const transaction = jest.fn((fn: (tx: unknown) => unknown) => fn(tx));
+    const prisma = {
+      $transaction: transaction,
+      program: { findUniqueOrThrow: jest.fn().mockResolvedValue({ id: 'p1' }) },
+    };
+
+    const module = await Test.createTestingModule({
+      providers: [
+        CapacityService,
+        { provide: PrismaService, useValue: prisma },
+        { provide: FxService, useValue: {} },
+      ],
+    }).compile();
+    const service = module.get(CapacityService);
+
+    const result = (await service.release(
+      { programRef: 'PRG-1', invoiceRef: 'INV-1' },
+      { rowId: 'ik2', clientId: 'c1', key: 'k2', method: 'POST', path: '/x', requestHash: 'h2' },
+    )) as { status: string };
+    expect(result.status).toBe('RELEASED');
+  });
+});
