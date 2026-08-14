@@ -1,0 +1,11 @@
+// Domain models are introduced in the next step. This file currently pins the
+// datasource and client generator so `prisma generate` runs in CI from day one.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
