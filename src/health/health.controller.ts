@@ -1,5 +1,6 @@
 import { Controller, Get } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
+import { Public } from '../auth/public.decorator';
 
 /**
  * Unauthenticated on purpose: this is the container liveness probe, not a
@@ -9,6 +10,7 @@ import { ApiOperation, ApiTags } from '@nestjs/swagger';
 @ApiTags('health')
 @Controller('health')
 export class HealthController {
+  @Public()
   @Get()
   @ApiOperation({ summary: 'Liveness probe' })
   check(): { status: string } {

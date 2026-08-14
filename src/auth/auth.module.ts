@@ -1,0 +1,27 @@
+import { Module } from '@nestjs/common';
+import { ConfigModule, ConfigService } from '@nestjs/config';
+import { JwtModule } from '@nestjs/jwt';
+import { APP_GUARD, Reflector } from '@nestjs/core';
+import { PrismaModule } from '../prisma/prisma.module';
+import { AuthService } from './auth.service';
+import { AuthController } from './auth.controller';
+import { JwtAuthGuard } from './jwt-auth.guard';
+import type { Env } from '../config/env.schema';
+
+@Module({
+  imports: [
+    PrismaModule,
+    JwtModule.registerAsync({
+      imports: [ConfigModule],
+      inject: [ConfigService],
+      useFactory: (config: ConfigService<Env, true>) => ({
+        secret: config.get('JWT_SECRET', { infer: true }),
+        signOptions: { expiresIn: config.get('JWT_EXPIRES_IN', { infer: true }) },
+      }),
+    }),
+  ],
+  controllers: [AuthController],
+  providers: [AuthService, Reflector, { provide: APP_GUARD, useClass: JwtAuthGuard }],
+  exports: [AuthService],
+})
+export class AuthModule {}
