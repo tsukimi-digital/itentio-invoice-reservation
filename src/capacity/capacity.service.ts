@@ -294,6 +294,28 @@ export class CapacityService {
     );
   }
 
+  async getAvailability(programRef: string): Promise<{
+    programRef: string;
+    currency: string;
+    totalLimit: string;
+    reservedAmount: string;
+    available: string;
+  }> {
+    const program = await this.prisma.program.findUnique({
+      where: { externalRef: programRef },
+      include: { currency: true },
+    });
+    if (!program) throw new NotFoundException('program');
+    const minorUnits = program.currency.minorUnits;
+    return {
+      programRef: program.externalRef,
+      currency: program.currencyCode,
+      totalLimit: program.totalLimit.toFixed(minorUnits),
+      reservedAmount: program.reservedAmount.toFixed(minorUnits),
+      available: program.totalLimit.minus(program.reservedAmount).toFixed(minorUnits),
+    };
+  }
+
   /// minorUnits pins the output to the programme currency's scale (e.g.
   /// "30.00", never "30") — see docs/DECISIONS.md ADR-002. Raw
   /// Prisma.Decimal#toString() does not preserve trailing zeros, so it must

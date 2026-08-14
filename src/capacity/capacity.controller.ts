@@ -1,4 +1,4 @@
-import { Body, Controller, Param, Post } from '@nestjs/common';
+import { Body, Controller, Get, Param, Post } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { CapacityService } from './capacity.service';
 import { ReserveDto } from './dto/reserve.dto';
@@ -39,5 +39,11 @@ export class CapacityController {
     @IdempotencyCtx() idem: IdempotencyContext,
   ) {
     return this.capacity.release({ programRef, invoiceRef: dto.invoiceRef }, idem);
+  }
+
+  @Get()
+  @ApiOperation({ summary: 'Current capacity availability for a program' })
+  getAvailability(@Param('programRef') programRef: string) {
+    return this.capacity.getAvailability(programRef);
   }
 }
