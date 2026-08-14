@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { NestFactory } from '@nestjs/core';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { AppModule } from './app.module';
+import { BigIntSerializerInterceptor } from './common/bigint-serializer.interceptor';
 import type { Env } from './config/env.schema';
 
 async function bootstrap() {
@@ -15,6 +16,7 @@ async function bootstrap() {
       transform: true,
     }),
   );
+  app.useGlobalInterceptors(new BigIntSerializerInterceptor());
 
   const config = new DocumentBuilder()
     .setTitle('Program Capacity & Invoice Reservation')
