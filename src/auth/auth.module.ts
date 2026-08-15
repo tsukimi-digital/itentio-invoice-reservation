@@ -6,6 +6,7 @@ import { PrismaModule } from '../prisma/prisma.module';
 import { AuthService } from './auth.service';
 import { AuthController } from './auth.controller';
 import { JwtAuthGuard } from './jwt-auth.guard';
+import { RolesGuard } from './roles.guard';
 import type { Env } from '../config/env.schema';
 
 @Module({
@@ -21,7 +22,16 @@ import type { Env } from '../config/env.schema';
     }),
   ],
   controllers: [AuthController],
-  providers: [AuthService, Reflector, { provide: APP_GUARD, useClass: JwtAuthGuard }],
+  providers: [
+    AuthService,
+    Reflector,
+    // Registration order matters: JwtAuthGuard must populate request.user
+    // before RolesGuard reads it. Both live in this same providers array so
+    // that ordering is deterministic, rather than relying on cross-module
+    // APP_GUARD resolution order.
+    { provide: APP_GUARD, useClass: JwtAuthGuard },
+    { provide: APP_GUARD, useClass: RolesGuard },
+  ],
   exports: [AuthService],
 })
 export class AuthModule {}

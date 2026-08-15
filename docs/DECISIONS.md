@@ -384,3 +384,33 @@ sharing one broker, not the cause; serial execution is simpler, matches how
 a single-broker CI service should be exercised anyway, and this is a
 40-second local test suite, not a scale where parallel e2e workers pay for
 themselves.
+
+## ADR-017: Role enforcement (RBAC)
+
+**Context:** `JwtAuthGuard` (ADR-009) verifies a token is valid but never
+looks at its `role` claim — every authenticated user, regardless of role,
+could reserve or release capacity. The `User`/JWT `role` field
+(`ADMIN`/`OPERATOR`/`READER`) existed purely as data until now.
+
+**Decision:** `@Roles(...roles: UserRole[])` (`SetMetadata`, same pattern as
+`@Public()`) plus a `RolesGuard` reading required roles via
+`Reflector.getAllAndOverride` and comparing against `request.user.role`.
+Registered as a third global `APP_GUARD`, in the same `AuthModule.providers`
+array as `JwtAuthGuard` — listed after it, since guard array order is what
+guarantees `request.user` is populated before `RolesGuard` reads it (relying
+on cross-module `APP_GUARD` resolution order for that would be fragile).
+`@Roles('ADMIN', 'OPERATOR')` applied to `reserve`/`release`; availability
+(`GET`) stays open to any authenticated role, including `READER` — a query
+endpoint has no overcommit risk to guard against.
+
+**Consequences:** `test/rbac.e2e-spec.ts` creates its own `READER`/`OPERATOR`/
+`ADMIN` test users directly via Prisma (mirroring `capacity.e2e-spec.ts`'s
+pattern), not via `prisma/seed.ts` — seed data stays production-representative
+(one admin), test fixtures stay test-local. A first draft of this test used
+fixed idempotency keys and a fixed program ref across test runs; since the
+idempotency claim replays on `(clientId, key)` but conflicts when the request
+body's hash differs (`requestedAt` is always "now"), re-running the suite
+against a non-fresh database produced a spurious 409 on the second run. Fixed
+by generating a fresh `programRef`/`invoiceRef`/`Idempotency-Key` per test
+run via `randomUUID()` — the test is now safe to re-run against a persistent
+local database, not just a throwaway one.

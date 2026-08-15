@@ -5,6 +5,7 @@ import { ReserveDto } from './dto/reserve.dto';
 import { ReleaseDto } from './dto/release.dto';
 import { IdempotencyCtx } from '../idempotency/idempotency-key.decorator';
 import type { IdempotencyContext } from '../idempotency/idempotency';
+import { Roles } from '../auth/roles.decorator';
 
 @ApiTags('capacity')
 @ApiBearerAuth()
@@ -12,6 +13,9 @@ import type { IdempotencyContext } from '../idempotency/idempotency';
 export class CapacityController {
   constructor(private readonly capacity: CapacityService) {}
 
+  // Availability (GET, below) is open to any authenticated role, including
+  // READER — only capacity-mutating actions are role-restricted.
+  @Roles('ADMIN', 'OPERATOR')
   @Post('reserve')
   @ApiOperation({ summary: 'Reserve program capacity for an invoice' })
   reserve(
@@ -31,6 +35,7 @@ export class CapacityController {
     );
   }
 
+  @Roles('ADMIN', 'OPERATOR')
   @Post('release')
   @ApiOperation({ summary: 'Release a program reservation on invoice repayment' })
   release(
