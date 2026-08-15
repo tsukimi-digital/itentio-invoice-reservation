@@ -1,0 +1,240 @@
+{
+  "info": {
+    "_postman_id": "6b6e6e2a-6c9a-4f8a-9d0a-2f5b1d3c7a11",
+    "name": "Itentio — Program Capacity & Invoice Reservation",
+    "description": "Backend-only service (no frontend) — tracks a financing program's credit capacity in real time. See README.md and docs/DECISIONS.md in the repo for the full write-up.\n\n**Before you start:**\n1. `docker compose up -d && npm run prisma:generate && npx prisma migrate deploy && npx prisma db seed`\n2. `npm run start:dev` (http://localhost:3000)\n3. Open the **`0 · Setup`** folder in this collection and read its description — the API has no endpoint to *create* a program (that's an intentional scope decision, see README/ADR), so you need one raw SQL insert before `reserve`/`release`/availability calls will work.\n4. Run **`1 · Auth → Login`** once. Its test script captures both the access token and the refresh token into collection variables automatically — every other request inherits `accessToken` as a Bearer token.\n\nDefault seeded login: `admin@itentio.dev` / `dev-only-password-change-me` (role `ADMIN`).\n\n**Since the last update:** `reserve`/`release` now require role `ADMIN` or `OPERATOR` (the seeded admin qualifies; a `READER`-role user gets 403 — see docs/DECISIONS.md ADR-017). `POST /auth/login` is rate-limited to 5 requests/minute — hitting it repeatedly while testing will start returning 429. Access tokens expire after 1h; use **`1 · Auth → Refresh token`** to get a new pair without re-sending the password (ADR-018) — it rotates the refresh token on every use, so the old one stops working immediately.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [{ "key": "token", "value": "{{accessToken}}", "type": "string" }]
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:3000", "type": "string" },
+    { "key": "accessToken", "value": "", "type": "string" },
+    {
+      "key": "refreshToken",
+      "value": "",
+      "type": "string",
+      "description": "Saved automatically by Login and by Refresh token's test scripts."
+    },
+    {
+      "key": "programRef",
+      "value": "PRG-DEMO",
+      "type": "string",
+      "description": "Must already exist — see the '0 · Setup' folder."
+    },
+    { "key": "invoiceRef", "value": "INV-DEMO-1", "type": "string" },
+    {
+      "key": "idempotencyKey",
+      "value": "11111111-1111-4111-8111-111111111111",
+      "type": "string",
+      "description": "Fixed value used by the 'Reserve (idempotent replay demo)' request — send that request twice in a row to see the second call return the exact same response without creating a second reservation."
+    }
+  ],
+  "item": [
+    {
+      "name": "0 · Setup",
+      "description": "The API deliberately exposes no endpoint to create a Program — that's an intentional scope decision (program creation is treated as back-office data entry, not part of the reserve/release/query surface; see README.md \"Trying it out\" and docs/DECISIONS.md). Create one directly in Postgres before using the requests below.\n\n**Option A — psql (matches docker-compose.yml credentials):**\n```\ndocker compose exec postgres psql -U itentio -d itentio -c \"\nINSERT INTO program (id, external_ref, name, currency_code, total_limit, updated_at)\nVALUES (gen_random_uuid(), 'PRG-DEMO', 'Postman demo', 'GBP', '10000.00', now())\nON CONFLICT (external_ref) DO NOTHING;\n\"\n```\n\n**Option B — Prisma Studio:** `npx prisma studio`, open the `Program` table, add a row with `externalRef = PRG-DEMO`, `currencyCode = GBP`, `totalLimit = 10000.00`.\n\nGBP, EUR, USD and JPY are already seeded as currencies by `npx prisma db seed`, so `PRG-DEMO` in GBP works out of the box. Change the `programRef` collection variable if you use a different external ref.",
+      "item": []
+    },
+    {
+      "name": "1 · Auth",
+      "item": [
+        {
+          "name": "Login",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('login succeeded', function () {",
+                  "  pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "const body = pm.response.json();",
+                  "pm.test('response has an accessToken', function () {",
+                  "  pm.expect(body.accessToken).to.be.a('string');",
+                  "});",
+                  "pm.test('response has a refreshToken', function () {",
+                  "  pm.expect(body.refreshToken).to.be.a('string');",
+                  "});",
+                  "",
+                  "if (body.accessToken) {",
+                  "  pm.collectionVariables.set('accessToken', body.accessToken);",
+                  "  console.log('accessToken saved to collection variable');",
+                  "}",
+                  "if (body.refreshToken) {",
+                  "  pm.collectionVariables.set('refreshToken', body.refreshToken);",
+                  "  console.log('refreshToken saved to collection variable');",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"admin@itentio.dev\",\n  \"password\": \"dev-only-password-change-me\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/auth/login",
+              "host": ["{{baseUrl}}"],
+              "path": ["auth", "login"]
+            },
+            "description": "Seeded credentials from prisma/seed.ts (role ADMIN). Run this first — the test script stores both the access token and refresh token into collection variables. Rate-limited to 5 requests/minute — repeated wrong-password testing will start returning 429 before 401."
+          }
+        },
+        {
+          "name": "Refresh token",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('refresh succeeded', function () {",
+                  "  pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "const body = pm.response.json();",
+                  "pm.test('response has a new accessToken and refreshToken', function () {",
+                  "  pm.expect(body.accessToken).to.be.a('string');",
+                  "  pm.expect(body.refreshToken).to.be.a('string');",
+                  "});",
+                  "",
+                  "if (body.accessToken) pm.collectionVariables.set('accessToken', body.accessToken);",
+                  "if (body.refreshToken) pm.collectionVariables.set('refreshToken', body.refreshToken);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"refreshToken\": \"{{refreshToken}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/auth/refresh",
+              "host": ["{{baseUrl}}"],
+              "path": ["auth", "refresh"]
+            },
+            "description": "Exchanges the refresh token for a new access+refresh pair — no password needed. Rotates on every use: the refresh token consumed here immediately stops working (docs/DECISIONS.md ADR-018), and the response's new refreshToken replaces it in the collection variable. Sending this request twice in a row with the same stored value will 401 the second time — that's expected, run Login again to get a fresh pair."
+          }
+        }
+      ]
+    },
+    {
+      "name": "2 · Capacity",
+      "item": [
+        {
+          "name": "Get availability",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{programRef}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["programs", "{{programRef}}"]
+            },
+            "description": "Returns { programRef, currency, totalLimit, reservedAmount, available } — amounts always as decimal strings (e.g. \"1000.00\"), never JSON numbers. Requires a Bearer token (401 without one)."
+          }
+        },
+        {
+          "name": "Reserve capacity",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}",
+                "description": "A fresh UUID per send — normal usage. See the separate 'Reserve (idempotent replay demo)' request to see what happens when you reuse the same key."
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"invoiceRef\": \"{{invoiceRef}}\",\n  \"amount\": \"100.00\",\n  \"currency\": \"GBP\",\n  \"requestedAt\": \"{{$isoTimestamp}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{programRef}}/reserve",
+              "host": ["{{baseUrl}}"],
+              "path": ["programs", "{{programRef}}", "reserve"]
+            },
+            "description": "Reserves 100.00 GBP against PRG-DEMO for invoice {{invoiceRef}}. If the invoice currency differs from the program currency (try \"amount\": \"50.00\", \"currency\": \"EUR\"), the response's reservedAmount reflects the seeded FX rate applied and frozen at reservation time — see docs/DECISIONS.md ADR-003.\n\nChange `invoiceRef` (collection variable, or edit the body directly) between calls if you want several independent reservations against the same program rather than re-hitting the same invoice."
+          }
+        },
+        {
+          "name": "Reserve (idempotent replay demo)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{idempotencyKey}}",
+                "description": "Fixed value (collection variable) — send this request twice in a row."
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"invoiceRef\": \"INV-IDEMPOTENCY-DEMO\",\n  \"amount\": \"25.00\",\n  \"currency\": \"GBP\",\n  \"requestedAt\": \"{{$isoTimestamp}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{programRef}}/reserve",
+              "host": ["{{baseUrl}}"],
+              "path": ["programs", "{{programRef}}", "reserve"]
+            },
+            "description": "Send this exact request twice in a row (same body, same Idempotency-Key). The second response is byte-identical to the first — no second reservation is created, and 'Get availability' won't show a second +25.00. This is the Idempotency-Key replay path (docs/DECISIONS.md — capacity.service.ts claimIdempotencyKey). To test it again later, either change the `idempotencyKey` collection variable to a new UUID, or change `invoiceRef` in the body — the business-key uniqueness on (program, invoice) is the durable guarantee that outlives the header's 24h TTL."
+          }
+        },
+        {
+          "name": "Release capacity",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Idempotency-Key", "value": "{{$guid}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"invoiceRef\": \"{{invoiceRef}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{programRef}}/release",
+              "host": ["{{baseUrl}}"],
+              "path": ["programs", "{{programRef}}", "release"]
+            },
+            "description": "Releases the reservation made for {{invoiceRef}} — returns exactly the frozen amount to available capacity (zero FX drift, even if the invoice was in a foreign currency). Releasing an already-released invoice is a no-op, not an error."
+          }
+        }
+      ]
+    },
+    {
+      "name": "3 · Health",
+      "item": [
+        {
+          "name": "Health check (no auth)",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/health",
+              "host": ["{{baseUrl}}"],
+              "path": ["health"]
+            },
+            "description": "The one deliberately unauthenticated endpoint — a liveness probe, not a business endpoint. Everything else in this collection requires the Bearer token from '1 · Auth → Login'."
+          }
+        }
+      ]
+    }
+  ]
+}
