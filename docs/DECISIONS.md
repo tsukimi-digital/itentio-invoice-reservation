@@ -414,3 +414,54 @@ against a non-fresh database produced a spurious 409 on the second run. Fixed
 by generating a fresh `programRef`/`invoiceRef`/`Idempotency-Key` per test
 run via `randomUUID()` — the test is now safe to re-run against a persistent
 local database, not just a throwaway one.
+
+## ADR-018: Refresh tokens — opaque, hashed, rotate-on-use
+
+**Context:** The access token (ADR-009) expires after `JWT_EXPIRES_IN` (1h
+default) with no renewal path — a client must re-`POST /auth/login` with the
+password again once it expires. A refresh mechanism was requested explicitly.
+
+**Decision:** `POST /auth/login` now returns `{ accessToken, refreshToken }`.
+The refresh token is an opaque 256-bit random value (`randomBytes(32)`,
+base64url), not a second JWT — only its SHA-256 hash is stored, in a new
+`refresh_token` table (`userId`, `tokenHash` unique, `expiresAt`, `revokedAt`
+nullable). `POST /auth/refresh` (`@Public()` — a refresh token is not a
+bearer JWT, so `JwtAuthGuard` doesn't apply to this route) hashes the
+presented token, looks it up, and rejects (401) if it's missing, revoked, or
+past `expiresAt`. On success it rotates: the presented row is revoked
+(`revokedAt = now()`) and a brand-new access+refresh pair is issued — the
+same rotation-on-use pattern used for idempotency keys elsewhere. TTL is
+`REFRESH_TOKEN_TTL_DAYS` (default 30), a plain integer-days env var rather
+than a duration string like `JWT_EXPIRES_IN` — `@nestjs/jwt`/`jsonwebtoken`
+parse duration strings internally, but computing `expiresAt` as a `Date`
+here needed a millisecond value directly, and adding a duration-string
+parsing dependency for one field wasn't worth it.
+
+**Alternatives rejected:**
+- A second, longer-lived JWT as the refresh token — self-contained JWTs
+  can't be revoked without a version/blocklist check, which is exactly the
+  `tokenVersion` mechanism this project explicitly chose not to build (see
+  below). An opaque, hashed, DB-backed token can be revoked by simply
+  marking the row — real server-side revocation, which is the entire point
+  of having a refresh token distinct from the access token.
+- Storing the raw refresh token — only its hash is ever persisted; a
+  database read (backup leak, compromised replica) cannot be turned into a
+  usable token, the same reasoning already applied to `passwordHash`.
+- No rotation (a reusable refresh token) — simpler, but a leaked refresh
+  token would then work indefinitely until its TTL, with no way to detect
+  the leak. Rotation means a stolen-and-replayed token can be used at most
+  once before the legitimate client's next refresh attempt fails loudly.
+- A `POST /auth/logout` endpoint — not requested and not built; scope creep
+  beyond the four explicitly named items in this round of work (rate
+  limiting, refresh tokens, role enforcement, `enableShutdownHooks`).
+
+**`tokenVersion` — explicitly NOT touched by this or any of the above.**
+`User.tokenVersion` (seeded at 0, carried in every JWT's claims since
+ADR-009) remains completely unenforced, by explicit instruction: it must
+continue being issued with the access token, but no code anywhere checks it
+against anything. This was flagged as an "unconscious limitation" in an
+earlier draft of `docs/PODSUMOWANIE-PL.md`; it is not one — it's a
+deliberate scoping decision, recorded here so a reviewer sees the field
+exists intentionally rather than reading it as an oversight. Refresh-token
+revocation, above, is real and independent of `tokenVersion` — it works via
+the `refresh_token` table, not via bumping a JWT claim.
