@@ -1,5 +1,7 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
+import { APP_GUARD } from '@nestjs/core';
+import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
 import { validateEnv } from './config/env.schema';
 import { HealthModule } from './health/health.module';
 import { AuthModule } from './auth/auth.module';
@@ -15,6 +17,11 @@ import { ReconciliationModule } from './reconciliation/reconciliation.module';
       isGlobal: true,
       validate: validateEnv,
     }),
+    // Named 'default' throttler applies to every route unless overridden
+    // with @Throttle({ default: {...} }) — see AuthController.login for the
+    // stricter override (brute-force protection on the one endpoint that
+    // doesn't require a token to hit).
+    ThrottlerModule.forRoot([{ name: 'default', ttl: 60_000, limit: 100 }]),
     PrismaModule,
     HealthModule,
     AuthModule,
@@ -23,5 +30,6 @@ import { ReconciliationModule } from './reconciliation/reconciliation.module';
     KafkaModule,
     ReconciliationModule,
   ],
+  providers: [{ provide: APP_GUARD, useClass: ThrottlerGuard }],
 })
 export class AppModule {}

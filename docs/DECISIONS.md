@@ -320,3 +320,67 @@ initially obvious fix) would have left `capacity.e2e-spec.ts` failing to
 bootstrap in CI even though it passes locally — a reminder that adding a
 module to `AppModule` can silently expand what every full-app-boot test
 needs, not just the tests written for that module.
+
+## ADR-015: `app.enableShutdownHooks()`
+
+**Context:** NestJS `OnModuleDestroy` lifecycle hooks (Kafka consumer/producer
+disconnect, the reconciliation worker's `setInterval`) only run on an
+explicit `app.close()` call unless `enableShutdownHooks()` is called — a real
+`SIGTERM` (container restart, `docker stop`, orchestrator rolling deploy)
+would otherwise bypass them entirely, leaving the consumer to sit in its
+group until it times out rather than leaving cleanly.
+
+**Decision:** Call `app.enableShutdownHooks()` immediately after
+`NestFactory.create(AppModule)` in `main.ts`.
+
+**Consequences:** Verified against a real signal, not just the NestJS docs —
+started the compiled app (`node dist/main.js`) and sent it a real `SIGTERM`
+via `kill -TERM $PID`; confirmed `"[Consumer] Stopped"` appears in the log
+before the process exits.
+
+## ADR-016: Rate limiting, JWT `role` enforcement, and refresh tokens
+
+**Context:** Four gaps were identified while writing `docs/PODSUMOWANIE-PL.md`
+(a Polish-language summary of technology decisions and limitations, requested
+separately from this ADR log): no rate limiting anywhere including
+`/auth/login`; the `role` claim carried by every JWT (ADR-009) was never
+checked by any guard — authentication without authorization; no refresh-token
+mechanism (a 1h access token with no renewal path); and `tokenVersion`,
+stored on `User` and included in every JWT's claims since ADR-009, has no
+enforcement path either. Explicit user direction: implement the first three;
+leave `tokenVersion` exactly as-is — it must continue being issued with the
+token, but building revocation-check logic around it is out of scope.
+
+**Decision (rate limiting):** `@nestjs/throttler`, registered as a second
+global `APP_GUARD` alongside `JwtAuthGuard` — NestJS supports multiple
+concurrent global guards, they simply all run per-request. A `'default'`
+named throttler (100 req/min) covers every route; `POST /auth/login`
+overrides it with a stricter `@Throttle({ default: { limit: 5, ttl: 60_000 } })`,
+since it's the one endpoint reachable without a token and therefore the
+brute-force target.
+
+**Decision (`tokenVersion`):** No enforcement logic added, by explicit
+instruction. It remains a field that is populated into the JWT at login time
+and otherwise inert — not a bug, a deliberately unbuilt revocation mechanism.
+Documented here (superseding the "unconscious limitation" framing this
+carried in the first draft of `docs/PODSUMOWANIE-PL.md`) so a reviewer sees
+this was a scoping decision, not an oversight.
+
+**Consequences — e2e test concurrency:** Adding `test/rate-limit.e2e-spec.ts`
+as a 5th e2e spec file tipped concurrent Kafka-connection contention (5
+independently-booted `AppModule` instances, each with its own kafkajs
+`Consumer`+`Admin`, connecting to the same single-node local KRaft broker
+under Jest's default parallel worker execution) into two failure modes in
+sequence: first plain Jest hook timeouts (fixed by adding
+`"testTimeout": 30000` to `test/jest-e2e.json` — previously unset, defaulting
+to Jest's global 5000ms), then a deeper kafkajs-internal crash
+(`TypeError: request is not a function` in the metadata-request protocol
+path) that only reproduced under parallel worker execution and never in any
+single-file run. Confirmed via `npm run test:e2e -- --runInBand`: 5/5 suites
+pass serially with zero flakiness. **Fix:** `test:e2e` now always runs
+`--runInBand`. Rejected alternative: raising Jest's `maxWorkers` contention
+threshold or adding kafkajs retry/backoff — treats a symptom of 5 apps
+sharing one broker, not the cause; serial execution is simpler, matches how
+a single-broker CI service should be exercised anyway, and this is a
+40-second local test suite, not a scale where parallel e2e workers pay for
+themselves.
