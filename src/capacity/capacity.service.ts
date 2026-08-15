@@ -1,9 +1,15 @@
-import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { randomUUID } from 'node:crypto';
 import { PrismaService } from '../prisma/prisma.service';
 import { FxService } from '../fx/fx.service';
 import { Money } from '../money/money';
+import { Dec } from '../money/decimal';
 import {
   claimIdempotencyKey,
   finishIdempotent,
@@ -11,7 +17,8 @@ import {
   Tx,
 } from '../idempotency/idempotency';
 import { InsufficientCapacityException } from './exceptions';
-import { buildReservationEvent } from '../outbox/outbox';
+import { PermanentEventError } from '../common/db-errors';
+import { buildReleaseEvent, buildReservationEvent } from '../outbox/outbox';
 
 export interface ReserveCommand {
   programRef: string;
@@ -88,15 +95,41 @@ export class CapacityService {
       include: { currency: true },
     });
 
-    const face = Money.of(cmd.amount, cmd.currency, program.currency.minorUnits);
-    const targetCurrency = await this.prisma.currency.findUniqueOrThrow({
-      where: { code: program.currencyCode },
+    // Quantise to the scale of the INVOICE's currency, not the programme's.
+    // Using the programme's scale rounded a GBP invoice to whole units for a
+    // JPY programme (1234.56 -> 1235), over-reserving capacity and writing the
+    // rounded figure into invoice.face_amount so the audit trail lied too.
+    // See docs/DECISIONS.md ADR-020.
+    const currencyCode = cmd.currency.toUpperCase();
+    const invoiceCurrency = await this.prisma.currency.findUnique({
+      where: { code: currencyCode },
     });
+    if (!invoiceCurrency) {
+      throw new BadRequestException(`unknown currency: ${cmd.currency}`);
+    }
+
+    const face = Money.of(cmd.amount, currencyCode, invoiceCurrency.minorUnits);
+    // Money.of quantises silently. For an inbound API amount that silence is
+    // wrong: "1000.5" JPY is not a rounding opportunity, it is a malformed
+    // request, and should say so rather than book a different number.
+    if (!face.toDecimal().eq(new Dec(cmd.amount))) {
+      throw new BadRequestException(
+        `amount ${cmd.amount} carries more precision than ${currencyCode} permits ` +
+          `(${invoiceCurrency.minorUnits} decimal places)`,
+      );
+    }
+
+    // Server time, never cmd.requestedAt. A client-supplied valuation instant
+    // let the caller pick which historical rate priced its reservation, and
+    // that rate is frozen onto the invoice and replayed at release, so the
+    // mispricing was permanent. requestedAt survives as business metadata on
+    // the ledger entry. See docs/DECISIONS.md ADR-019.
+    const valuedAt = new Date();
     const conversion = await this.fx.convert(
       face,
       program.currencyCode,
-      targetCurrency.minorUnits,
-      cmd.requestedAt,
+      program.currency.minorUnits,
+      valuedAt,
     );
 
     return withRetry(() =>
@@ -123,7 +156,7 @@ export class CapacityService {
           where: { programId_externalRef: { programId: program.id, externalRef: cmd.invoiceRef } },
         });
         if (invoice?.status === 'RESERVED') {
-          return finishIdempotent(tx, idem, this.toView(invoice, targetCurrency.minorUnits));
+          return finishIdempotent(tx, idem, this.toView(invoice, program.currency.minorUnits));
         }
         if (invoice && invoice.status !== 'REGISTERED') {
           throw new ConflictException(`invoice is ${invoice.status}`);
@@ -134,7 +167,7 @@ export class CapacityService {
               programId: program.id,
               externalRef: cmd.invoiceRef,
               faceAmount: face.toDecimal(),
-              currencyCode: cmd.currency,
+              currencyCode,
             },
           });
         }
@@ -226,7 +259,7 @@ export class CapacityService {
         // STEP 7 — seal the idempotency key in the same transaction as the
         // money move: a crash in between is impossible, so a replay can
         // never re-execute.
-        return finishIdempotent(tx, idem, this.toView(finalInvoice, targetCurrency.minorUnits));
+        return finishIdempotent(tx, idem, this.toView(finalInvoice, program.currency.minorUnits));
       }, TX_OPTS),
     );
   }
@@ -288,6 +321,7 @@ export class CapacityService {
           );
         }
         const row = updated[0];
+        const releasedAt = new Date();
 
         await tx.capacityLedgerEntry.create({
           data: {
@@ -300,9 +334,29 @@ export class CapacityService {
             balanceReservedAfter: row.reserved_amount,
             balanceLimitAfter: row.total_limit,
             invoiceId: invoice.id,
-            occurredAt: new Date(),
+            occurredAt: releasedAt,
             idempotencyKeyId: idem.rowId,
             eventId: randomUUID(),
+          },
+        });
+
+        // Same transaction as the ledger append, exactly as the reserve path
+        // does. Without this the release consumed a ledger seq that treasury
+        // never saw, which silently broke the acknowledged_local_seq watermark
+        // reconciliation depends on. See docs/DECISIONS.md ADR-022.
+        const outboxEvent = buildReleaseEvent({
+          programRef: cmd.programRef,
+          invoiceRef: cmd.invoiceRef,
+          seq: row.assigned_seq,
+          amount: amount.toString(),
+          currency: program.currencyCode,
+          occurredAt: releasedAt,
+        });
+        await tx.outboxMessage.create({
+          data: {
+            topic: outboxEvent.topic,
+            key: outboxEvent.key,
+            payload: outboxEvent.payload as Prisma.InputJsonValue,
           },
         });
 
@@ -347,26 +401,60 @@ export class CapacityService {
       program_ref: string;
       event_id: string;
       produced_at: string;
+      event_seq?: bigint | null;
       delta: { amount: string; currency: string; direction: 'RESERVE' | 'RELEASE' };
     },
   ): Promise<void> {
-    const program = await tx.program.findUniqueOrThrow({
+    const program = await tx.program.findUnique({
       where: { externalRef: event.program_ref },
     });
+    if (!program) {
+      throw new PermanentEventError(`unknown program ${event.program_ref}`);
+    }
+
+    // The delta modifies program.reserved_amount, a column denominated in the
+    // programme's currency, so the amount must already be in that currency —
+    // there is nothing else it could sensibly be. The event carries no rate,
+    // and converting at one of ours would book an FX residue with no invoice
+    // to freeze it against, contradicting ADR-003.
+    //
+    // So `delta.currency` is an assertion about the producer's view of the
+    // world, not an instruction. A mismatch is a contract violation, and is
+    // dead-lettered rather than applied. applyBaseline has always checked this
+    // for snapshots; the delta path simply forgot. See ADR-028.
+    const deltaCurrency = event.delta.currency.toUpperCase();
+    if (deltaCurrency !== program.currencyCode) {
+      throw new PermanentEventError(
+        `treasury delta for ${event.program_ref} is denominated in ${deltaCurrency}, ` +
+          `but the programme is ${program.currencyCode}`,
+      );
+    }
+
     const [locked] = await tx.$queryRaw<{ id: string }[]>`
       SELECT id FROM program WHERE id = ${program.id}::uuid FOR NO KEY UPDATE`;
-    if (!locked) throw new NotFoundException('program');
+    if (!locked) throw new PermanentEventError(`program ${event.program_ref} vanished under lock`);
 
     const signed =
       event.delta.direction === 'RESERVE' ? event.delta.amount : `-${event.delta.amount}`;
+    // Guarded exactly like the API path. Without the limit predicate this
+    // UPDATE walked straight into the program_no_overcommit CHECK, which the
+    // consumer then classified as transient and retried forever.
     const updated = await tx.$queryRaw<
       { reserved_amount: Prisma.Decimal; total_limit: Prisma.Decimal; assigned_seq: bigint }[]
     >`
       UPDATE program SET reserved_amount = reserved_amount + ${signed}::numeric,
              next_ledger_seq = next_ledger_seq + 1, version = version + 1, updated_at = now()
        WHERE id = ${program.id}::uuid
+         AND reserved_amount + ${signed}::numeric >= 0
+         AND (reserved_amount + ${signed}::numeric <= total_limit OR over_commit_acknowledged)
       RETURNING reserved_amount, total_limit, (next_ledger_seq - 1) AS assigned_seq
     `;
+    if (updated.length === 0) {
+      throw new PermanentEventError(
+        `treasury delta ${event.event_id} (${signed} ${deltaCurrency}) would move ` +
+          `${event.program_ref} outside [0, total_limit]`,
+      );
+    }
     const row = updated[0];
     await tx.capacityLedgerEntry.create({
       data: {
@@ -379,6 +467,12 @@ export class CapacityService {
         balanceLimitAfter: row.total_limit,
         occurredAt: new Date(event.produced_at),
         eventId: event.event_id,
+        // Treasury's own sequence for this event. Previously never written, so
+        // the column was permanently NULL and reconciliation's
+        // `treasury_event_seq > included_through_event_seq` predicate — the
+        // whole TREASURY branch of the replay — could never be true. See
+        // docs/DECISIONS.md ADR-026.
+        treasuryEventSeq: event.event_seq ?? null,
       },
     });
   }

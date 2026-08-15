@@ -4,6 +4,7 @@ import request from 'supertest';
 import type { App } from 'supertest/types';
 import { randomUUID } from 'node:crypto';
 import { AppModule } from '../src/app.module';
+import { configureApp } from '../src/bootstrap';
 import { PrismaService } from '../src/prisma/prisma.service';
 import { hashPassword } from '../src/auth/password';
 
@@ -27,6 +28,8 @@ describe('RBAC (e2e)', () => {
   beforeAll(async () => {
     const moduleFixture = await Test.createTestingModule({ imports: [AppModule] }).compile();
     app = moduleFixture.createNestApplication();
+    // Same global pipes, filters and interceptors the real process installs.
+    configureApp(app);
     await app.init();
     prisma = app.get(PrismaService);
 

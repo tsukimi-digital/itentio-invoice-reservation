@@ -3,6 +3,7 @@ import { Test } from '@nestjs/testing';
 import request from 'supertest';
 import type { App } from 'supertest/types';
 import { AppModule } from '../src/app.module';
+import { configureApp } from '../src/bootstrap';
 
 describe('Refresh token (e2e)', () => {
   let app: INestApplication;
@@ -10,6 +11,8 @@ describe('Refresh token (e2e)', () => {
   beforeAll(async () => {
     const moduleFixture = await Test.createTestingModule({ imports: [AppModule] }).compile();
     app = moduleFixture.createNestApplication();
+    // Same global pipes, filters and interceptors the real process installs.
+    configureApp(app);
     await app.init();
   });
 

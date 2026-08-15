@@ -32,6 +32,9 @@ run it and how the pieces fit together.
   (DB constraints, 50-way concurrent reservation stress test) that spin up
   disposable containers rather than mocking the database.
 
+Why each of these, what was rejected, and what deliberately is *not* in the
+stack (no Redis, no schema registry, no metrics backend): ADR-035.
+
 ## Architecture
 
 ```
@@ -134,7 +137,18 @@ Full interactive API docs (with request/response schemas) at `/docs`.
 Retrying the reserve call with the **same** `Idempotency-Key` and body returns
 the original response unchanged rather than double-reserving — the header is a
 latency optimisation; the underlying guarantee is a business-key uniqueness
-constraint on `(programId, invoiceRef)` that outlives the header's 24h TTL.
+constraint on `(programId, invoiceRef)`.
+
+The key's fingerprint covers the HTTP method and the concrete URL as well as
+the body, so the same key used against a different programme is a `409` rather
+than a replay of the first programme's response (ADR-021). Note that
+`idempotency_key.expires_at` is recorded but **not** enforced and there is no
+sweeper, so in practice a key replays indefinitely — see ADR-034.
+
+```bash
+# 6. Reconciliation discrepancies (ADMIN only)
+curl -H "Authorization: Bearer $TOKEN" localhost:3000/programs/PRG-1/discrepancies
+```
 
 ## Development
 
@@ -146,14 +160,41 @@ npm run test:e2e    # real Postgres (Testcontainers) + real HTTP + real Kafka
 npm test            # both, in sequence — what CI runs
 ```
 
-`test:e2e` includes a 50-way concurrent-reservation stress test
-(`test/concurrency.e2e-spec.ts`) that proves the capacity guard holds under
-real contention, not just in a single-threaded mock.
+What `test:e2e` actually exercises:
+
+- **Concurrency** — `test/concurrency.e2e-spec.ts` runs 50 simultaneous
+  reservations against a real Postgres and asserts that exactly the affordable
+  number succeed and that the ledger sum matches the counter. The capacity
+  guard is proven under real contention, not in a single-threaded mock.
+- **Kafka** — `test/kafka-consumer.e2e-spec.ts` and
+  `test/reconciliation.e2e-spec.ts` publish real messages and assert on the
+  resulting database state, including the dead-letter path and the
+  snapshot-versus-delta replay. The broker is driven, not merely required in
+  order to boot.
+- **Multi-currency** — `test/fx-cross-currency.e2e-spec.ts` covers reserve →
+  release across two currencies with different minor-unit scales, plus rate
+  staleness and hostile input. This is the path `DbFxRateProvider` lives on and
+  the one the assignment calls out explicitly.
+- **Idempotency scope** — `test/idempotency-scope.e2e-spec.ts` covers replay,
+  conflict, and the same key used against a second programme.
+
+Every full-app e2e spec calls `configureApp()` from `src/bootstrap.ts` — the
+same function `main.ts` uses — so the suite exercises the application that
+actually ships, global pipes and exception filter included (ADR-033).
 
 ## Known limitations
 
-Documented in full, with rationale, in `docs/DECISIONS.md` ADR-012: dedup-table
-retention isn't bounded against Kafka topic retention, there's no alerting on
-stale reconciliation snapshots, and the locking strategy assumes a direct
-Postgres connection (not a transaction-pooling PgBouncer). None of these affect
-running the service locally.
+ADR-012: dedup-table retention isn't bounded against Kafka topic retention,
+there's no alerting on stale reconciliation snapshots, and the locking strategy
+assumes a direct Postgres connection (not a transaction-pooling PgBouncer).
+
+ADR-034 lists what is deliberately not implemented — including the unenforced
+idempotency-key TTL, the unread `payload_hash`, the absence of per-account login
+throttling, and the schema columns and enum values that model behaviour with no
+code path.
+
+The throttler keeps its counters in process memory, so limits are per-replica
+and reset on deploy; `TRUST_PROXY_HOPS` must be set to the real hop count for
+`req.ip` (and therefore rate limiting) to mean anything behind a load balancer.
+
+None of these affect running the service locally.

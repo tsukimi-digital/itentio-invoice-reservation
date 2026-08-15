@@ -36,6 +36,22 @@ services:
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
       CLUSTER_ID: itentio-local-cluster
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    # Postgres had a named volume and Kafka had none, so `docker compose down`
+    # wiped the broker while the inbox table survived — offsets restarted at 0
+    # against rows that still claimed those offsets. That asymmetry is what
+    # turned the redundant (topic, partition, offset) unique constraint into a
+    # permanent consumer stall. See docs/DECISIONS.md ADR-023.
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test:
+        ['CMD-SHELL', '/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list']
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 15s
 
 volumes:
   postgres-data:
+  kafka-data:

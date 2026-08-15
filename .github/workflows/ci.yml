@@ -38,6 +38,12 @@ jobs:
           KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
           KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
           CLUSTER_ID: itentio-ci-cluster
+        # Postgres had a health gate and Kafka did not, so readiness was down
+        # to whether `npm ci` happened to take longer than broker startup.
+        options: >-
+          --health-cmd "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list"
+          --health-interval 5s --health-timeout 10s --health-retries 20
+          --health-start-period 15s
     env:
       DATABASE_URL: postgresql://itentio:itentio@localhost:5432/itentio?schema=public
       JWT_SECRET: ci-only-secret-not-for-production

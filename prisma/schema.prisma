@@ -228,7 +228,14 @@ model ProcessedMessage {
   receivedAt  DateTime  @default(now()) @map("received_at") @db.Timestamptz(6)
   processedAt DateTime? @map("processed_at") @db.Timestamptz(6)
 
-  @@unique([topic, partition, offset])
+  /// Deliberately an index, NOT a unique constraint. Dedup is keyed on the
+  /// producer-supplied `event_id`, which survives topic recreation; Kafka
+  /// offsets do not. A unique constraint here meant that after any offset
+  /// reset (e.g. `docker compose down`, which wipes the broker because only
+  /// Postgres has a volume) the first new event collided on a triple that
+  /// `ON CONFLICT (event_id)` does not cover, aborting the transaction and
+  /// wedging the partition permanently. See docs/DECISIONS.md ADR-023.
+  @@index([topic, partition, offset])
   @@index([receivedAt])
   @@map("processed_message")
 }
@@ -389,10 +396,18 @@ model OutboxMessage {
   payload   Json         @db.JsonB
   status    OutboxStatus @default(PENDING)
   attempts  Int          @default(0)
+
+  /// Claim/backoff marker. The relay pushes this forward in the same
+  /// statement that increments `attempts`, so a claimed row is invisible to
+  /// other workers (and to the same worker's next tick) until its backoff
+  /// elapses. Without it the relay re-selected the same failing rows every
+  /// second and starved everything behind them.
+  availableAt DateTime @default(now()) @map("available_at") @db.Timestamptz(6)
+
   createdAt DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
   sentAt    DateTime?    @map("sent_at") @db.Timestamptz(6)
   lastError String?      @map("last_error")
 
-  @@index([status, createdAt])
+  @@index([status, availableAt, createdAt])
   @@map("outbox_message")
 }

@@ -1,12 +1,41 @@
 import { PrismaClient } from '@prisma/client';
-import { scryptSync, randomBytes } from 'node:crypto';
+import { hashPassword } from '../src/auth/password';
 
 const prisma = new PrismaClient();
 
-function hashPassword(plain: string): string {
-  const salt = randomBytes(16);
-  const hash = scryptSync(plain, salt, 64);
-  return `scrypt$16384$8$1$${salt.toString('base64')}$${hash.toString('base64')}`;
+const DEV_ADMIN_EMAIL = 'admin@itentio.dev';
+const DEV_ADMIN_PASSWORD = 'dev-only-password-change-me';
+
+/// The admin fixture is a development convenience, and `prisma db seed` is a
+/// command someone can run anywhere — including against production, where it
+/// would create an ADMIN account whose password is printed in the README.
+/// Outside development the password must be supplied explicitly, or no user
+/// is created at all.
+async function seedAdminUser(): Promise<void> {
+  const isProduction = process.env.NODE_ENV === 'production';
+  const suppliedPassword = process.env.SEED_ADMIN_PASSWORD;
+
+  if (isProduction && !suppliedPassword) {
+    console.warn(
+      'NODE_ENV=production and SEED_ADMIN_PASSWORD is unset — skipping admin user. ' +
+        'Set SEED_ADMIN_PASSWORD to seed one deliberately.',
+    );
+    return;
+  }
+
+  const email = process.env.SEED_ADMIN_EMAIL ?? DEV_ADMIN_EMAIL;
+  const password = suppliedPassword ?? DEV_ADMIN_PASSWORD;
+
+  await prisma.user.upsert({
+    where: { email },
+    update: {},
+    create: {
+      email,
+      passwordHash: hashPassword(password),
+      displayName: 'Dev Admin',
+      role: 'ADMIN',
+    },
+  });
 }
 
 async function main() {
@@ -30,16 +59,15 @@ async function main() {
     skipDuplicates: true,
   });
 
-  await prisma.user.upsert({
-    where: { email: 'admin@itentio.dev' },
-    update: {},
-    create: {
-      email: 'admin@itentio.dev',
-      passwordHash: hashPassword('dev-only-password-change-me'),
-      displayName: 'Dev Admin',
-      role: 'ADMIN',
-    },
-  });
+  await seedAdminUser();
 }
 
-main().finally(() => prisma.$disconnect());
+// `main().finally(...)` alone swallowed every failure and still exited 0, so a
+// broken seed looked like a successful one — including in CI, which runs
+// `prisma db seed` before the test suite.
+main()
+  .catch((error: unknown) => {
+    console.error('Seed failed:', error);
+    process.exitCode = 1;
+  })
+  .finally(() => prisma.$disconnect());

@@ -1,7 +1,7 @@
 import { z } from 'zod';
 
 // Multi-schema topic (deltas + snapshots) via a oneOf-style discriminated
-// union — see docs/DECISIONS.md ADR-000 (kafka-schema-registry skill).
+// union, so an unknown event_type fails closed rather than being coerced.
 const Decimalish = z.string().regex(/^-?\d{1,20}(\.\d{1,4})?$/);
 
 const snapshotPosition = z.object({
@@ -19,6 +19,18 @@ const deltaEvent = z.object({
   schema_version: z.literal(1),
   produced_at: z.string().datetime({ offset: true }),
   program_ref: z.string().min(1).max(64),
+
+  /// Treasury's own per-programme sequence number for this event, recorded on
+  /// the ledger entry as `treasury_event_seq` and compared against a
+  /// snapshot's `included_through_event_seq` during reconciliation.
+  ///
+  /// Optional on purpose. Making it required would send every delta from a
+  /// producer that does not yet emit it straight to the dead-letter table.
+  /// A null sequence means "unknown whether treasury has folded this in", and
+  /// reconciliation replays such entries rather than dropping them — see
+  /// ADR-026 and the deliberate over-replay bias in ADR-004/005.
+  event_seq: z.coerce.bigint().nullable().default(null),
+
   delta: z.object({
     amount: Decimalish,
     currency: z.string().length(3),
