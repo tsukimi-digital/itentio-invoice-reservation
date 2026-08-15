@@ -8,6 +8,11 @@ import type { Env } from './config/env.schema';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
+  // Without this, onModuleDestroy (Kafka consumer/producer disconnect, the
+  // reconciliation worker's interval) only runs on an explicit app.close()
+  // call — a real SIGTERM (container restart) would not trigger it, leaving
+  // the consumer to time out of its group instead of leaving cleanly.
+  app.enableShutdownHooks();
 
   app.useGlobalPipes(
     new ValidationPipe({
