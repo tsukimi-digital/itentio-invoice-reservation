@@ -1,14 +1,13 @@
 import { scryptSync, randomBytes, timingSafeEqual, type ScryptOptions } from 'node:crypto';
 
 /// node:crypto only — no native build dependency, so `npm ci` needs no
-/// toolchain. See docs/DECISIONS.md ADR-11.
+/// toolchain.
 
 const ALGORITHM_TAG = 'scrypt';
 const FIELD_SEPARATOR = '$';
 
 /// scrypt work factors, written into the stored string so a later cost
-/// increase is detectable per hash. ADR-13 records that the verify path does
-/// not yet rehash on a mismatch.
+/// increase is detectable per hash.
 const COST = 16_384;
 const BLOCK_SIZE = 8;
 const PARALLELISM = 1;

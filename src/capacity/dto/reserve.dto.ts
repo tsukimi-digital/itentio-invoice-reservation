@@ -41,8 +41,8 @@ export class ReserveDto {
   currency!: string;
 
   /// Business metadata only — it is recorded as the ledger entry's
-  /// `occurred_at`. It deliberately does not select the FX rate (ADR-03), but
-  /// a future-dated value would still corrupt the audit trail.
+  /// `occurred_at`. It deliberately does not select the FX rate, but a
+  /// future-dated value would still corrupt the audit trail.
   @Type(() => Date)
   @IsDate()
   @MaxDate(() => new Date(), { message: 'requestedAt must not be in the future' })

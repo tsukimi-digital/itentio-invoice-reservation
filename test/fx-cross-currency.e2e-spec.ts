@@ -12,7 +12,7 @@ import { hashPassword } from '../src/auth/password';
 /// requirement — "Programs and invoices may be denominated in different
 /// currencies" — and the only spec that executes DbFxRateProvider (the
 /// concurrency spec deliberately injects a provider that throws). The
-/// quantisation rules in ADR-02 are invisible with GBP -> GBP on both sides.
+/// currency quantisation rules are invisible with GBP -> GBP on both sides.
 describe('Cross-currency reservation (e2e)', () => {
   let app: INestApplication;
   let prisma: PrismaService;
@@ -166,7 +166,7 @@ describe('Cross-currency reservation (e2e)', () => {
 
     const after = await availability();
     // Zero drift by construction: release replays the frozen amount rather
-    // than reconverting at a new rate (ADR-03).
+    // than reconverting at a new rate.
     expect((after.body as { available: string }).available).toBe(
       (before.body as { available: string }).available,
     );
@@ -206,6 +206,60 @@ describe('Cross-currency reservation (e2e)', () => {
       .expect(422);
 
     expect((res.body as { error: string }).error).toBe('FX_RATE_UNAVAILABLE');
+  });
+
+  it('replays a completed reservation on retry even if its FX rate has since become unavailable', async () => {
+    // The idempotency claim must be checked before FX is ever resolved: a
+    // retry of an already-completed request has to replay deterministically,
+    // not fail because a rate that priced the ORIGINAL request is no longer
+    // there. NZD is exclusive to this test (no pivot leg either), so once its
+    // one rate is deleted, any fresh FX resolution for it is guaranteed to
+    // throw FxRateUnavailableError.
+    await prisma.currency.upsert({
+      where: { code: 'NZD' },
+      update: {},
+      create: { code: 'NZD', minorUnits: 2, name: 'New Zealand Dollar' },
+    });
+    await prisma.fxRate.create({
+      data: {
+        baseCurrencyCode: 'NZD',
+        quoteCurrencyCode: 'JPY',
+        rate: '85.000000000000',
+        source: 'SEED',
+        asOf: new Date(),
+      },
+    });
+
+    const invoiceRef = `INV-${randomUUID()}`;
+    const idempotencyKey = randomUUID();
+    const body = {
+      invoiceRef,
+      amount: '100.00',
+      currency: 'NZD',
+      requestedAt: new Date().toISOString(),
+    };
+
+    const original = await request(app.getHttpServer() as App)
+      .post(`/programs/${programRef}/reserve`)
+      .set(auth())
+      .set('Idempotency-Key', idempotencyKey)
+      .send(body)
+      .expect(201);
+
+    // The rate that priced the reservation above is gone. A fresh FX
+    // resolution for NZD would now fail outright.
+    await prisma.fxRate.deleteMany({
+      where: { baseCurrencyCode: 'NZD', quoteCurrencyCode: 'JPY' },
+    });
+
+    const retry = await request(app.getHttpServer() as App)
+      .post(`/programs/${programRef}/reserve`)
+      .set(auth())
+      .set('Idempotency-Key', idempotencyKey)
+      .send(body)
+      .expect(201);
+
+    expect(retry.body).toEqual(original.body);
   });
 
   describe('hostile input is rejected as 4xx, not 500', () => {

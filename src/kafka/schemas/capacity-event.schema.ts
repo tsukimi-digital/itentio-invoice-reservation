@@ -52,8 +52,8 @@ const deltaEvent = z.object({
   /// Optional on purpose. Making it required would send every delta from a
   /// producer that does not yet emit it straight to the dead-letter table.
   /// A null sequence means "unknown whether treasury has folded this in", and
-  /// reconciliation replays such entries rather than dropping them — the same
-  /// deliberate over-replay bias described in ADR-06.
+  /// reconciliation replays such entries rather than dropping them, the same
+  /// deliberate over-replay bias applied everywhere else in reconciliation.
   event_seq: z.coerce.bigint().nullable().default(null),
 
   delta: z.object({

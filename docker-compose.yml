@@ -41,7 +41,7 @@ services:
     # `docker compose down` wipes the broker while the inbox table survives —
     # offsets restart at 0 against rows that still claim them, and that
     # asymmetry turns a redundant (topic, partition, offset) unique constraint
-    # into a permanent consumer stall. See docs/DECISIONS.md ADR-05.
+    # into a permanent consumer stall.
     volumes:
       - kafka-data:/var/lib/kafka/data
     healthcheck:

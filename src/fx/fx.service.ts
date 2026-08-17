@@ -15,8 +15,8 @@ export interface FxConversion {
   };
 }
 
-/// The single point of rounding in the whole system. See docs/DECISIONS.md
-/// ADR-02: HALF_EVEN, applied exactly once, here.
+/// The single point of rounding in the whole system: HALF_EVEN, applied
+/// exactly once, here.
 @Injectable()
 export class FxService {
   constructor(@Inject(FX_RATE_PROVIDER) private readonly provider: FxRateProvider) {}

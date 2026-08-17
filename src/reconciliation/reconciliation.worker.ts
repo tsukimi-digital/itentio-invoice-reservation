@@ -41,15 +41,15 @@ const REPLAY_STRATEGY = { WATERMARK: 'watermark', TIME_FALLBACK: 'time-fallback'
 /// dead and may be re-claimed. `claimNextJob` commits status = CLAIMED and
 /// then releases the row lock, so without a lease a SIGKILL mid-`applyBaseline`
 /// leaves the job in a state that matches no selector — invisible to every
-/// worker, forever. See docs/DECISIONS.md ADR-10.
+/// worker, forever.
 const CLAIM_LEASE_MS = 5 * 60 * 1000;
 
 /// Attempts before a job stops being retried and waits for a human.
 const MAX_JOB_ATTEMPTS = 5;
 
-/// Clock-skew allowance for the time-based replay fallback. Treasury's `as_of`
-/// and our `occurred_at` come from different clocks, and ADR-06 commits
-/// to erring towards over-replay: over-replaying understates available
+/// Clock-skew allowance for the time-based replay fallback. Treasury's
+/// `as_of` and our `occurred_at` come from different clocks, and the bias is
+/// deliberately towards over-replay: over-replaying understates available
 /// capacity (a recoverable false rejection), under-replaying overstates it
 /// (a real overcommit).
 const REPLAY_SKEW_MS = 5 * 60 * 1000;
@@ -97,9 +97,6 @@ interface ClaimedJob {
   phase: JobPhase;
 }
 
-/// See docs/DECISIONS.md ADR-06 (baseline+replay, bidirectional
-/// acknowledgement watermark) and ADR-07 (overcommit after reconciliation
-/// is flagged, never clamped).
 @Injectable()
 export class ReconciliationWorker implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(ReconciliationWorker.name);
@@ -317,11 +314,22 @@ export class ReconciliationWorker implements OnModuleInit, OnModuleDestroy {
         const includedKnown = header.included_through_event_seq !== null;
         const ackSeq = ackKnown ? BigInt(header.acknowledged_local_seq!) : 0n;
         const includedSeq = includedKnown ? BigInt(header.included_through_event_seq!) : 0n;
-        // Fallback when the snapshot carries no watermark (ADR-06). Treating an
-        // absent watermark as ackSeq = 0 would replay every API entry ever
-        // recorded, double-counting the entire history into a snapshot that
-        // already contains it and freezing the programme, so the replay is
-        // bounded by a time window instead.
+        // Fallback when the snapshot carries no watermark. Treating an absent
+        // watermark as ackSeq = 0 would replay every API entry ever recorded,
+        // double-counting the entire history into a snapshot that already
+        // contains it and freezing the programme, so the replay is bounded by
+        // a time window instead.
+        //
+        // The two branches deliberately compare against different columns.
+        // TREASURY-origin entries compare `occurred_at` (their own
+        // `produced_at`) against the snapshot's `as_of`, both timestamps from
+        // treasury's own clock; that is what REPLAY_SKEW_MS accounts for.
+        // API-origin entries compare `recorded_at` instead: their
+        // `occurred_at` is `requestedAt` from the request body, caller-
+        // supplied with no lower bound, so a backdated value would otherwise
+        // fall outside the window and drop a real reservation out of the
+        // replay. `recorded_at` is set by the database at insert time and
+        // can't be influenced by the caller.
         const timeCutoff = new Date(job.asOf.getTime() - REPLAY_SKEW_MS);
 
         const [agg] = await tx.$queryRaw<{ sum_delta: Prisma.Decimal; hi: bigint; n: bigint }[]>`
@@ -331,13 +339,13 @@ export class ReconciliationWorker implements OnModuleInit, OnModuleDestroy {
            AND CASE
                  WHEN origin = 'API' THEN
                    CASE WHEN ${ackKnown}::boolean THEN seq > ${ackSeq}
-                        ELSE occurred_at > ${timeCutoff}
+                        ELSE recorded_at > ${timeCutoff}
                    END
                  WHEN origin = 'TREASURY' THEN
                    -- treasury_event_seq IS NULL means "we cannot tell whether
-                   -- treasury folded this in" (ADR-06). Such an entry falls
-                   -- back to the time window rather than failing the sequence
-                   -- test, which would silently erase it from the baseline.
+                   -- treasury folded this in". Such an entry falls back to the
+                   -- time window rather than failing the sequence test, which
+                   -- would silently erase it from the baseline.
                    CASE WHEN ${includedKnown}::boolean AND treasury_event_seq IS NOT NULL
                         THEN treasury_event_seq > ${includedSeq}
                         ELSE occurred_at > ${timeCutoff}
@@ -460,7 +468,7 @@ export class ReconciliationWorker implements OnModuleInit, OnModuleDestroy {
             // belonging to a DIFFERENT programme — raising a drift alert
             // against the wrong figures and copying another programme's
             // amounts into this one's discrepancy record, which is readable
-            // over HTTP. See docs/DECISIONS.md ADR-06.
+            // over HTTP.
             const invoice = await tx.invoice.findUnique({
               where: { programId_externalRef: { programId, externalRef: pos.invoiceRef } },
             });
@@ -491,8 +499,8 @@ export class ReconciliationWorker implements OnModuleInit, OnModuleDestroy {
             }
             if (
               invoice.status === InvoiceStatus.RESERVED &&
-              // Decimal comparison, not string comparison: ADR-02 itself warns
-              // that toString() does not preserve trailing zeros.
+              // Decimal comparison, not string comparison: toString() does
+              // not preserve trailing zeros.
               !(invoice.reservedProgramAmount?.equals(pos.reservedAmount) ?? false)
             ) {
               await this.recordDiscrepancy(tx, {
@@ -526,9 +534,9 @@ export class ReconciliationWorker implements OnModuleInit, OnModuleDestroy {
     });
   }
 
-  /// A discrepancy is only "visible and auditable" (ADR-07) if it reaches an
-  /// operator, so each one is logged at `warn` as it is recorded as well as
-  /// being queryable over HTTP via ReconciliationController.
+  /// A discrepancy is only useful once it reaches an operator, so each one is
+  /// logged at `warn` as it is recorded as well as being queryable over HTTP
+  /// via ReconciliationController.
   private async recordDiscrepancy(
     tx: Prisma.TransactionClient,
     input: {

@@ -140,8 +140,8 @@ describe('Reconciliation (e2e)', () => {
   });
 
   it('replays a treasury delta that arrived after the snapshot watermark', async () => {
-    // Pins the guard against the classic lost update on reconciliation
-    // (ADR-06). The replay predicate is
+    // Pins the guard against the classic lost update on reconciliation. The
+    // replay predicate is
     // `treasury_event_seq > included_through_event_seq`, so that column must
     // be populated: NULL makes the TREASURY branch unsatisfiable — `NULL > n`
     // is NULL — and the baseline erases every delta not yet folded in.
@@ -192,9 +192,10 @@ describe('Reconciliation (e2e)', () => {
   });
 
   it('falls back to a time window when the snapshot omits the ack watermark', async () => {
-    // ADR-06's fallback. A missing watermark must not be read as ackSeq = 0,
-    // which replays every API entry ever recorded and double-counts the whole
-    // history into a snapshot that already contains it.
+    // Pins the time-window fallback. A missing watermark must not be read as
+    // ackSeq = 0, which replays every API entry ever recorded and
+    // double-counts the whole history into a snapshot that already contains
+    // it.
     const programRef = await createProgram('PRG-RECON-FALLBACK');
 
     await publish({
@@ -238,6 +239,53 @@ describe('Reconciliation (e2e)', () => {
     expect(baseline.metadata).toMatchObject({ replayStrategy: 'time-fallback' });
   });
 
+  it('replays a reservation submitted with a backdated requestedAt during the time-fallback window', async () => {
+    // requestedAt is caller-supplied business metadata with no lower bound.
+    // The time-fallback replay must not judge "did this happen recently" by
+    // that field, or a backdated requestedAt drops a real reservation out of
+    // the replay and understates the balance a watermark-less snapshot
+    // restores.
+    const programRef = await createProgram('PRG-RECON-BACKDATED');
+    const invoiceRef = `INV-${randomUUID()}`;
+    const wayInThePast = new Date(Date.now() - 400 * 24 * 60 * 60 * 1000).toISOString();
+
+    await request(app.getHttpServer() as App)
+      .post(`/programs/${programRef}/reserve`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .set('Idempotency-Key', randomUUID())
+      .send({ invoiceRef, amount: '400.00', currency: 'GBP', requestedAt: wayInThePast })
+      .expect(201);
+
+    await waitFor(async () => {
+      const p = await prisma.program.findUniqueOrThrow({ where: { externalRef: programRef } });
+      return p.reservedAmount.toFixed(2) === '400.00' ? true : null;
+    }, 'the backdated reservation to be applied locally');
+
+    // A snapshot with no watermark, reporting a balance from before treasury
+    // ever saw this reservation.
+    await publish(
+      snapshotEvent({
+        programRef,
+        reservedAmount: '0.00',
+        totalLimit: '100000.00',
+        acknowledgedLocalSeq: null,
+        includedThroughEventSeq: null,
+      }),
+    );
+
+    const program = await waitFor(async () => {
+      const p = await prisma.program.findUniqueOrThrow({ where: { externalRef: programRef } });
+      return p.treasurySnapshotSeq !== null ? p : null;
+    }, 'the baseline to be applied');
+
+    // 0 (snapshot) + 400 (replayed reservation) = 400, not 0.
+    expect(program.reservedAmount.toFixed(2)).toBe('400.00');
+    const baseline = await prisma.capacityLedgerEntry.findFirstOrThrow({
+      where: { programId: program.id, entryType: 'RECONCILE_BASELINE' },
+    });
+    expect(baseline.metadata).toMatchObject({ replayStrategy: 'time-fallback' });
+  });
+
   it('exposes recorded discrepancies to an ADMIN and hides them from a READER', async () => {
     const programRef = await createProgram('PRG-RECON-DISC');
 
@@ -262,7 +310,7 @@ describe('Reconciliation (e2e)', () => {
     );
 
     // Pins that a recorded discrepancy is actually reachable by an operator
-    // over HTTP — "visible and auditable" needs a reader (ADR-07).
+    // over HTTP — "visible and auditable" needs a reader.
     const body = await waitFor(async () => {
       const res = await request(app.getHttpServer() as App)
         .get(`/programs/${programRef}/discrepancies`)

@@ -33,8 +33,7 @@ const TRANSIENT_SQLSTATES = new Set([
 ///
 /// The default is deliberately `false` (permanent). An unknown deterministic
 /// error retried forever wedges the whole partition; the same error parked in
-/// the dead-letter table is visible, inspectable and costs one message. See
-/// docs/DECISIONS.md ADR-10.
+/// the dead-letter table is visible, inspectable and costs one message.
 export function isTransientDbError(err: unknown): boolean {
   if (err instanceof Prisma.PrismaClientInitializationError) return true;
   if (err instanceof Prisma.PrismaClientRustPanicError) return true;

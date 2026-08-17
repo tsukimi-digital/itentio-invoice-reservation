@@ -83,8 +83,6 @@ interface GuardedUpdateRow {
   assigned_seq: bigint;
 }
 
-/// See docs/DECISIONS.md ADR-04 (pessimistic locking, FOR NO KEY UPDATE) and
-/// ADR-02 and ADR-03 (money representation, FX freeze).
 @Injectable()
 export class CapacityService {
   constructor(
@@ -93,9 +91,13 @@ export class CapacityService {
   ) {}
 
   async reserve(cmd: ReserveCommand, idem: IdempotencyContext): Promise<unknown> {
-    // STEP 0 — outside the transaction: FX resolution is a read of an
-    // append-only table, so doing it before the row lock keeps the lock hold
-    // time to a handful of statements.
+    // STEP 0 — outside the transaction: static lookups only (programme,
+    // currency), never anything whose availability can change between an
+    // original request and a client's retry of it. FX rates go stale on
+    // their own schedule, unrelated to this request, so resolving one here
+    // would fail a retry of an already-completed reservation on grounds that
+    // have nothing to do with what was actually asked — the idempotency
+    // claim below has to see the request before FX does.
     const program = await this.prisma.program.findUniqueOrThrow({
       where: { externalRef: cmd.programRef },
       include: { currency: true },
@@ -105,7 +107,7 @@ export class CapacityService {
     // The programme's scale would round a GBP invoice to whole units against a
     // JPY programme (1234.56 -> 1235), over-reserving capacity and persisting
     // the rounded figure as invoice.face_amount, so the audit trail would agree
-    // with the error. See docs/DECISIONS.md ADR-02.
+    // with the error.
     const currencyCode = cmd.currency.toUpperCase();
     const invoiceCurrency = await this.prisma.currency.findUnique({
       where: { code: currencyCode },
@@ -125,29 +127,36 @@ export class CapacityService {
       );
     }
 
-    // Server time, never cmd.requestedAt. A client-supplied valuation instant
-    // would let the caller pick which historical rate prices its reservation,
-    // and that rate is frozen onto the invoice and replayed at release, so the
-    // mispricing would be permanent. requestedAt survives as business metadata
-    // on the ledger entry. See docs/DECISIONS.md ADR-03.
-    const valuedAt = new Date();
-    const conversion = await this.fx.convert(
-      face,
-      program.currencyCode,
-      program.currency.minorUnits,
-      valuedAt,
-    );
-
     return withRetry(() =>
       this.prisma.$transaction(async (tx) => {
         await tx.$executeRawUnsafe(`SET LOCAL lock_timeout = '3s'`);
 
-        // STEP 1 — idempotency claim, first in lock order.
+        // STEP 1 — idempotency claim, first in lock order and before FX is
+        // ever consulted. A retry of a completed request must replay
+        // deterministically; resolving a rate first would let a rate that
+        // went stale between the original call and the retry turn a
+        // successful replay into a spurious 422.
         const claim = await claimIdempotencyKey(tx, idem);
         if (claim.kind === 'replay') return claim.storedResponse;
         if (claim.kind === 'conflict') {
           throw new ConflictException('Idempotency-Key reused with a different request body');
         }
+
+        // STEP 1b — FX resolution, still ahead of the row lock (a read of an
+        // append-only table, so it doesn't extend how long the lock is
+        // held) but now reached only for a genuinely new request.
+        // Server time, never cmd.requestedAt. A client-supplied valuation
+        // instant would let the caller pick which historical rate prices
+        // its reservation, and that rate is frozen onto the invoice and
+        // replayed at release, so the mispricing would be permanent.
+        // requestedAt survives as business metadata on the ledger entry.
+        const valuedAt = new Date();
+        const conversion = await this.fx.convert(
+          face,
+          program.currencyCode,
+          program.currency.minorUnits,
+          valuedAt,
+        );
 
         // STEP 2 — lock the programme row.
         const [locked] = await tx.$queryRaw<ProgramLockRow[]>`
@@ -254,9 +263,8 @@ export class CapacityService {
         });
 
         // STEP 5b — outbox: carries this reservation's ledger seq so
-        // treasury can echo it back as an acknowledgement watermark (see
-        // docs/DECISIONS.md ADR-06). Same transaction as the ledger
-        // append, so the two can never disagree.
+        // treasury can echo it back as an acknowledgement watermark. Same
+        // transaction as the ledger append, so the two can never disagree.
         const outboxEvent = buildReservationEvent({
           programRef: cmd.programRef,
           invoiceRef: cmd.invoiceRef,
@@ -337,8 +345,8 @@ export class CapacityService {
         }
 
         // EXACTLY the amount that was reserved — never recomputed at today's
-        // rate. See docs/DECISIONS.md ADR-03: this is what makes capacity
-        // return to precisely its prior level.
+        // rate. This is what makes capacity return to precisely its prior
+        // level.
         const amount = invoice.reserved_program_amount!;
 
         const updated = await tx.$queryRaw<
@@ -378,7 +386,7 @@ export class CapacityService {
         // Same transaction as the ledger append, exactly as the reserve path
         // does. Without it the release consumes a ledger seq that treasury
         // never sees, silently breaking the acknowledged_local_seq watermark
-        // reconciliation depends on. See docs/DECISIONS.md ADR-09.
+        // reconciliation depends on.
         const outboxEvent = buildReleaseEvent({
           programRef: cmd.programRef,
           invoiceRef: cmd.invoiceRef,
@@ -455,12 +463,12 @@ export class CapacityService {
     // programme's currency, so the amount must already be in that currency —
     // there is nothing else it could sensibly be. The event carries no rate,
     // and converting at one of ours would book an FX residue with no invoice
-    // to freeze it against, contradicting ADR-03.
+    // to freeze it against.
     //
     // So `delta.currency` is an assertion about the producer's view of the
     // world, not an instruction. A mismatch is a contract violation, and is
     // dead-lettered rather than applied — the same check applyBaseline makes
-    // for snapshots. See ADR-06.
+    // for snapshots.
     const deltaCurrency = event.delta.currency.toUpperCase();
     if (deltaCurrency !== program.currencyCode) {
       throw new PermanentEventError(
@@ -512,16 +520,15 @@ export class CapacityService {
         // `treasury_event_seq > included_through_event_seq` predicate — the
         // whole TREASURY branch of the replay — compares it against the
         // snapshot watermark, so a NULL here leaves that branch unsatisfiable.
-        // See docs/DECISIONS.md ADR-06.
         treasuryEventSeq: event.event_seq ?? null,
       },
     });
   }
 
   /// minorUnits pins the output to the programme currency's scale (e.g.
-  /// "30.00", never "30") — see docs/DECISIONS.md ADR-02. Raw
-  /// Prisma.Decimal#toString() does not preserve trailing zeros, so it must
-  /// not be called directly on money fields headed for an API response.
+  /// "30.00", never "30"). Raw Prisma.Decimal#toString() does not preserve
+  /// trailing zeros, so it must not be called directly on money fields
+  /// headed for an API response.
   private toView(
     invoice: {
       id: string;

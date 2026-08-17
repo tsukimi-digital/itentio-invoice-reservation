@@ -1,7 +1,7 @@
 import { IdempotencyStatus, type Prisma, type PrismaClient } from '@prisma/client';
 
 /// Recorded on the key row but never read back — the replay's HTTP status comes
-/// from Nest, not from here. See docs/DECISIONS.md ADR-13.
+/// from Nest, not from here.
 const RECORDED_REPLAY_STATUS = 200;
 
 /// How long a key row advertises itself as replayable. ADR-13 records that the

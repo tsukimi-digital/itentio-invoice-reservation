@@ -27,7 +27,7 @@ export class DbFxRateProvider implements FxRateProvider {
   /// time — never a client-controlled timestamp. A request body that picked
   /// the valuation instant would choose which historical rate prices the
   /// reservation, and the chosen rate is then frozen onto the invoice and
-  /// replayed at release, so the mispricing would be permanent. See ADR-03.
+  /// replayed at release, so the mispricing would be permanent.
   async resolve(base: string, quote: string, at: Date): Promise<ResolvedRate> {
     const direct = await this.newestUsable(base, quote, at);
     if (direct) {

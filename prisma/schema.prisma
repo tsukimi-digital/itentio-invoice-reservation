@@ -8,8 +8,7 @@ datasource db {
 }
 
 // Money columns: numeric(24,4). Scale 4 covers every live ISO-4217 minor-unit
-// exponent (0/2/3/4) with one column type — see docs/DECISIONS.md ADR-02.
-// Rate columns: numeric(24,12) — see ADR-02.
+// exponent (0/2/3/4) with one column type. Rate columns: numeric(24,12).
 
 enum ProgramStatus {
   ACTIVE
@@ -234,7 +233,7 @@ model ProcessedMessage {
   /// any offset reset (e.g. `docker compose down`, which wipes the broker
   /// because only Postgres has a volume) collide on a triple that
   /// `ON CONFLICT (event_id)` does not cover, aborting the transaction and
-  /// wedging the partition permanently. See docs/DECISIONS.md ADR-05.
+  /// wedging the partition permanently.
   @@index([topic, partition, offset])
   @@index([receivedAt])
   @@map("processed_message")

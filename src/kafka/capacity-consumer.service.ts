@@ -18,9 +18,9 @@ const TREASURY_TOPIC = 'treasury.capacity-events';
 const MAX_TRANSIENT_ATTEMPTS = 5;
 const CONNECT_RETRY_MS = 5_000;
 
-/// At-least-once consumption + idempotent DB writes, never Kafka EOS — see
-/// docs/DECISIONS.md ADR-05. A bulk snapshot is never applied inline
-/// here; it's parked as a ReconciliationJob and applied by a separate
+/// At-least-once consumption + idempotent DB writes, never Kafka EOS. A bulk
+/// snapshot is never applied inline here; it's parked as a ReconciliationJob
+/// and applied by a separate
 /// worker in bounded chunks, so a long reconciliation never risks a
 /// consumer rebalance (kafkajs has no max.poll.interval.ms — heartbeat()
 /// between every message is what keeps this consumer alive under load).
@@ -61,7 +61,6 @@ export class CapacityConsumerService implements OnModuleInit, OnModuleDestroy {
     // `admin.connect()` inside onModuleInit would abort NestFactory.create and
     // take the entire HTTP API down with it — including reserve, release and
     // availability, which touch only Postgres. Kafka is the deferrable part.
-    // See docs/DECISIONS.md ADR-05.
     void this.startWithRetry();
   }
 
@@ -138,7 +137,7 @@ export class CapacityConsumerService implements OnModuleInit, OnModuleDestroy {
   /// anyway: it is unprocessable regardless of the DLQ's state, and blocking
   /// the partition on it turns the loss of one message into the loss of every
   /// message behind it. The `error`-level log is the only remaining trace, by
-  /// design. See docs/DECISIONS.md ADR-10.
+  /// design.
   private async deadLetter(
     topic: string,
     partition: number,

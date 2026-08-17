@@ -6,8 +6,8 @@ import { ProgramParamsDto } from '../capacity/dto/program-params.dto';
 import { UserRole } from '@prisma/client';
 import { DEFAULT_DISCREPANCY_LIMIT, ListDiscrepanciesDto } from './dto/list-discrepancies.dto';
 
-/// ADR-07 leaves a programme that ends up over its limit after reconciliation
-/// "visible and auditable rather than hidden". A `reconciliation_discrepancy`
+/// A programme that ends up over its limit after reconciliation stays
+/// visible and auditable rather than hidden. A `reconciliation_discrepancy`
 /// row read by nothing would make "auditable" mean "open a psql session", so
 /// this endpoint — together with the warn-level log the worker emits — is
 /// what carries that guarantee.
@@ -43,8 +43,8 @@ export class ReconciliationController {
       // Amounts are formatted here rather than handed over as Prisma.Decimal:
       // the global BigInt interceptor walks response objects with
       // Object.entries and would serialise a Decimal as its internals
-      // ({"s":1,"e":2,"d":[...]}), bypassing toJSON. ADR-02's rule — money
-      // leaves as a fixed-scale string, never a number — is enforced at the
+      // ({"s":1,"e":2,"d":[...]}), bypassing toJSON. Money leaves as a
+      // fixed-scale string, never a number, and that rule is enforced at the
       // boundary.
       discrepancies: rows.map((row) => ({
         id: row.id,

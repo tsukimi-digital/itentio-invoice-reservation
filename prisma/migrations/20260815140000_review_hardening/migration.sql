@@ -1,8 +1,7 @@
--- DB-level guarantees layered on the core schema. Each block cites the ADR
--- that explains why.
+-- DB-level guarantees layered on the core schema.
 
 -- ---------------------------------------------------------------------------
--- ADR-09: outbox claim/backoff marker.
+-- Outbox claim/backoff marker.
 -- The relay claims a row by pushing available_at forward, bounds attempts and
 -- backs off. Without it two instances publish duplicates and 50
 -- permanently-failing rows starve every newer message behind them (the batch
@@ -16,7 +15,7 @@ CREATE INDEX "outbox_message_status_available_at_created_at_idx"
   ON "outbox_message"("status", "available_at", "created_at");
 
 -- ---------------------------------------------------------------------------
--- ADR-05: Kafka offsets are not a stable identity.
+-- Kafka offsets are not a stable identity.
 -- The inbox insert uses `ON CONFLICT (event_id) DO NOTHING`, which covers one
 -- unique constraint only. A second unique on (topic, partition, offset) means
 -- that after any offset reset — including a routine `docker compose down`,

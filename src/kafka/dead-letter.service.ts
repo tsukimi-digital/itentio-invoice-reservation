@@ -42,7 +42,7 @@ export class DeadLetterService {
 /// to show for it. Every unparseable shape therefore has a storable
 /// representation: a non-JSON payload, a tombstone (`value: null`) and a
 /// literal JSON `null` (which the JSONB NOT NULL constraint rejects) all
-/// become an `__unparsed` envelope. See docs/DECISIONS.md ADR-10.
+/// become an `__unparsed` envelope.
 function toStorablePayload(message: KafkaMessage): Prisma.InputJsonValue {
   if (message.value === null || message.value === undefined) {
     return { __unparsed: true, reason: 'tombstone', raw: null };

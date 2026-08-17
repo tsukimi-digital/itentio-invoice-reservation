@@ -8,7 +8,7 @@ describe('Money', () => {
     expect(m.toString()).toBe('18.24');
   });
 
-  // ADR-02 commits to ROUND_HALF_EVEN (banker's rounding) so that ties do not
+  // Money rounds with ROUND_HALF_EVEN (banker's rounding) so that ties do not
   // drift systematically in one direction across a large reservation volume.
   // Only exact ties can pin that down: assertions on non-tie values, or on
   // rates landing exactly on a representable figure, stay green under HALF_UP

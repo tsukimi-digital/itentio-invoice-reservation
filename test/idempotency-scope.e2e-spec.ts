@@ -14,8 +14,6 @@ import { hashPassword } from '../src/auth/password';
 /// fingerprint the second call replays the first programme's response
 /// (HTTP 201, wrong invoiceId) and the second programme is never debited,
 /// with the caller none the wiser.
-///
-/// See docs/DECISIONS.md ADR-08.
 describe('Idempotency-Key scope (e2e)', () => {
   let app: INestApplication;
   let prisma: PrismaService;

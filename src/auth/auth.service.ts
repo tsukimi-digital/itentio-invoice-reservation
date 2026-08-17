@@ -66,12 +66,12 @@ export class AuthService {
   /// followed by an unconditional write would let two concurrent refreshes of
   /// the same token both observe `revokedAt = null` and both walk away with a
   /// valid, independent token chain, breaking the "usable at most once"
-  /// guarantee in ADR-11.
+  /// guarantee.
   ///
   /// Presenting an already-revoked token revokes the user's whole token
   /// family. Answering 401 alone would leave an attacker who rotated first
   /// with a live session that renews itself indefinitely, the legitimate
-  /// client's failure being the only signal. See docs/DECISIONS.md ADR-11.
+  /// client's failure being the only signal.
   async refresh(rawToken: string): Promise<TokenPair> {
     const tokenHash = hashToken(rawToken);
     const stored = await this.prisma.refreshToken.findUnique({

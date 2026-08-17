@@ -52,8 +52,7 @@ function canonicalize(value: unknown, depth = 0): unknown {
 /// request would replay the first programme's response — 201 with the wrong
 /// invoiceId — and PRG-B would never be debited. `req.route.path` cannot
 /// substitute for this: it is the route *template*
-/// (`/programs/:programRef/reserve`), identical for every programme. See
-/// docs/DECISIONS.md ADR-08.
+/// (`/programs/:programRef/reserve`), identical for every programme.
 export const IdempotencyCtx = createParamDecorator(
   (_: unknown, ctx: ExecutionContext): IdempotencyContext => {
     const req = ctx.switchToHttp().getRequest<RequestWithIdempotencyInputs>();
