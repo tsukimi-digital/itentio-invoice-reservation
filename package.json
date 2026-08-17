@@ -10,6 +10,7 @@
     "start:dev": "nest start --watch",
     "start:prod": "node dist/main",
     "lint": "eslint \"{src,test}/**/*.ts\"",
+    "audit": "npm audit --audit-level=high",
     "format": "prettier --write \"{src,test}/**/*.ts\"",
     "test": "npm run test:unit && npm run test:e2e",
     "test:unit": "jest",
@@ -62,6 +63,11 @@
     "tsconfig-paths": "^4.2.0",
     "typescript": "^5.7.3",
     "typescript-eslint": "^8.20.0"
+  },
+  "overrides": {
+    "@nestjs/swagger": {
+      "js-yaml": "^5.2.2"
+    }
   },
   "prisma": {
     "seed": "ts-node prisma/seed.ts"

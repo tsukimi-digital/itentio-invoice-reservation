@@ -38,8 +38,9 @@ jobs:
           KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
           KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
           CLUSTER_ID: itentio-ci-cluster
-        # Postgres had a health gate and Kafka did not, so readiness was down
-        # to whether `npm ci` happened to take longer than broker startup.
+        # Kafka gets a health gate of its own, as Postgres does: without one,
+        # readiness is down to whether `npm ci` happens to take longer than
+        # broker startup.
         options: >-
           --health-cmd "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list"
           --health-interval 5s --health-timeout 10s --health-retries 20
@@ -58,6 +59,9 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      # Dependency hygiene is a build gate, not a periodic chore: without this
+      # the pipeline goes green with known high-severity advisories in the tree.
+      - run: npm run audit
       - run: npm run prisma:generate
       - run: npx prisma migrate deploy
       - run: npx prisma db seed

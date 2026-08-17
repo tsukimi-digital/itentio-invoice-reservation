@@ -1,11 +1,10 @@
 import { z } from 'zod';
 
 /// Values that ship in `.env.example` so that `cp .env.example .env` yields a
-/// runnable service. That convenience is deliberate and stays — what must not
-/// happen is one of them reaching production, which is exactly what a plain
-/// `min(16)` allowed: the placeholder below is 34 characters long, so it
-/// satisfied the length rule and booted a production process with an HMAC
-/// signing key published in the repository.
+/// runnable service. That convenience is deliberate; what must not happen is
+/// one of them reaching production. A length rule alone cannot stop that — the
+/// placeholder below is 34 characters — so these values are refused by
+/// identity, not by length, when NODE_ENV is production.
 const KNOWN_DEV_SECRETS = new Set(['dev-only-insecure-secret-change-me']);
 
 const PRODUCTION_MIN_SECRET_LENGTH = 32;
@@ -39,9 +38,9 @@ export const envSchema = z
     TRUST_PROXY_HOPS: z.coerce.number().int().nonnegative().default(0),
 
     // Currency used to derive a cross rate when no direct or inverse rate
-    // exists. Previously read straight from process.env at module load, which
-    // bypassed this whole schema: a typo produced a pivot with no rates and
-    // failed at request time instead of at boot.
+    // exists. Declared here rather than read from process.env at module load,
+    // so a typo is a boot failure instead of a pivot with no rates that only
+    // fails at request time.
     FX_PIVOT_CURRENCY: z.string().length(3).toUpperCase().default('USD'),
 
     // Upper bound on how stale a rate may be and still be used for a

@@ -20,13 +20,13 @@ interface LedgerEventInput {
 /// Every outbound event carries the local ledger `seq` it corresponds to.
 /// Treasury echoes the highest one it has folded into its reported
 /// `reserved_amount` as `acknowledged_local_seq`, and reconciliation replays
-/// only entries above that watermark (ADR-004/005).
+/// only entries above that watermark (ADR-06).
 ///
-/// That contract is only sound if EVERY local `seq` is published. Releases
-/// used to allocate a ledger `seq` and publish nothing, so treasury could
-/// acknowledge seq 3 while never having seen the release at seq 2 —
-/// reconciliation then skipped the release as "already included" and restored
-/// capacity that had in fact been given back. See docs/DECISIONS.md ADR-022.
+/// That contract is only sound if EVERY local `seq` is published, releases
+/// included. A ledger `seq` allocated but never published lets treasury
+/// acknowledge seq 3 without having seen the release at seq 2 — reconciliation
+/// then skips that release as "already included" and restores capacity that
+/// was in fact given back. See docs/DECISIONS.md ADR-09.
 function buildLedgerEvent(eventType: string, input: LedgerEventInput): OutboxEvent {
   return {
     topic: RESERVATION_EVENTS_TOPIC,

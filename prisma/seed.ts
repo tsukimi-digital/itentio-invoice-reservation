@@ -59,12 +59,35 @@ async function main() {
     skipDuplicates: true,
   });
 
+  // Two programmes, so a reviewer can exercise the API — including the
+  // cross-currency path the brief calls out — straight after seeding, without
+  // hand-creating a row first. `PRG-1` carries the limit used as the example in
+  // the assignment; `PRG-2` is denominated in a zero-decimal currency, so a GBP
+  // invoice against it converts and rounds to whole yen.
+  await prisma.program.createMany({
+    data: [
+      {
+        externalRef: 'PRG-1',
+        name: 'Demo Supply Chain Programme',
+        currencyCode: 'GBP',
+        totalLimit: '10000000.0000',
+      },
+      {
+        externalRef: 'PRG-2',
+        name: 'Demo JPY Programme',
+        currencyCode: 'JPY',
+        totalLimit: '1500000000.0000',
+      },
+    ],
+    skipDuplicates: true,
+  });
+
   await seedAdminUser();
 }
 
-// `main().finally(...)` alone swallowed every failure and still exited 0, so a
-// broken seed looked like a successful one — including in CI, which runs
-// `prisma db seed` before the test suite.
+// A failed seed must exit non-zero: `main().finally(...)` alone swallows the
+// rejection and still exits 0, so a broken seed looks like a successful one —
+// including in CI, which runs `prisma db seed` before the test suite.
 main()
   .catch((error: unknown) => {
     console.error('Seed failed:', error);

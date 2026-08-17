@@ -26,16 +26,15 @@ const TRANSIENT_SQLSTATES = new Set([
 
 /// Classifies a failure as retryable.
 ///
-/// The Kafka consumer previously rethrew *every* error from its transaction
-/// with the comment "let kafkajs retry; do not DLQ transient DB errors" — but
-/// the errors it saw were mostly permanent: a CHECK violation, an unknown
-/// programme, a malformed numeric. Those fail identically on every redelivery,
-/// so the partition stopped advancing forever.
+/// Most errors the Kafka consumer sees are deterministic — a CHECK violation,
+/// an unknown programme, a malformed numeric — and fail identically on every
+/// redelivery. Rethrowing them all so kafkajs retries stops the partition
+/// advancing at all, so only the codes above are treated as retryable.
 ///
 /// The default is deliberately `false` (permanent). An unknown deterministic
 /// error retried forever wedges the whole partition; the same error parked in
 /// the dead-letter table is visible, inspectable and costs one message. See
-/// docs/DECISIONS.md ADR-025.
+/// docs/DECISIONS.md ADR-10.
 export function isTransientDbError(err: unknown): boolean {
   if (err instanceof Prisma.PrismaClientInitializationError) return true;
   if (err instanceof Prisma.PrismaClientRustPanicError) return true;

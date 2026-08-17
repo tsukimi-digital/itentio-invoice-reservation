@@ -26,10 +26,10 @@ function hashToken(raw: string): string {
 /// A real scrypt hash of a value nobody knows, computed once per process.
 ///
 /// `login` verifies against this when the e-mail does not exist, so the miss
-/// path pays the same ~80ms KDF cost as a hit. Without it the short-circuit
-/// `!user || ... || verifyPassword(...)` answered an unknown address in about
-/// a millisecond and a known one two orders of magnitude slower — a reliable
-/// account-enumeration oracle, identical status code notwithstanding.
+/// path pays the same ~80ms KDF cost as a hit. Short-circuiting instead
+/// answers an unknown address in about a millisecond and a known one two
+/// orders of magnitude slower — a reliable account-enumeration oracle,
+/// identical status code notwithstanding.
 const DUMMY_PASSWORD_HASH = hashPassword(randomBytes(32).toString('hex'));
 
 @Injectable()
@@ -62,18 +62,16 @@ export class AuthService {
 
   /// Rotation-on-use with reuse detection.
   ///
-  /// Two things were wrong before. The revocation was a read followed by a
-  /// separate unconditional write, so two concurrent refreshes with the same
-  /// token both observed `revokedAt = null` and both walked away with a valid,
-  /// independent token chain — the "usable at most once" guarantee in ADR-018
-  /// simply did not hold under concurrency. And replaying an already-revoked
-  /// token merely returned 401: the attacker who rotated first kept a live
-  /// session that renewed itself indefinitely, while the legitimate client's
-  /// failure was the only signal and nothing acted on it.
+  /// The revoke is a conditional UPDATE, so exactly one caller can win: a read
+  /// followed by an unconditional write would let two concurrent refreshes of
+  /// the same token both observe `revokedAt = null` and both walk away with a
+  /// valid, independent token chain, breaking the "usable at most once"
+  /// guarantee in ADR-11.
   ///
-  /// Now the revoke is a conditional UPDATE (exactly one caller can win), and
-  /// presenting a revoked token revokes the user's whole token family. See
-  /// docs/DECISIONS.md ADR-031.
+  /// Presenting an already-revoked token revokes the user's whole token
+  /// family. Answering 401 alone would leave an attacker who rotated first
+  /// with a live session that renews itself indefinitely, the legitimate
+  /// client's failure being the only signal. See docs/DECISIONS.md ADR-11.
   async refresh(rawToken: string): Promise<TokenPair> {
     const tokenHash = hashToken(rawToken);
     const stored = await this.prisma.refreshToken.findUnique({

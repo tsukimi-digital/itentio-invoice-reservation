@@ -53,6 +53,9 @@ describe('Reconciliation (e2e)', () => {
     acknowledgedLocalSeq: string | null;
     includedThroughEventSeq: string | null;
     positions?: unknown[];
+    snapshotId?: string;
+    chunkIndex?: number;
+    chunkCount?: number;
   }) {
     return {
       event_id: randomUUID(),
@@ -62,7 +65,7 @@ describe('Reconciliation (e2e)', () => {
       program_ref: input.programRef,
       program_currency: 'GBP',
       snapshot: {
-        snapshot_id: `SNAP-${randomUUID()}`,
+        snapshot_id: input.snapshotId ?? `SNAP-${randomUUID()}`,
         snapshot_seq: 1,
         as_of: new Date().toISOString(),
         total_limit: input.totalLimit,
@@ -70,8 +73,8 @@ describe('Reconciliation (e2e)', () => {
         acknowledged_local_seq: input.acknowledgedLocalSeq,
         included_through_event_seq: input.includedThroughEventSeq,
         position_count: input.positions?.length ?? 0,
-        chunk_index: 0,
-        chunk_count: 1,
+        chunk_index: input.chunkIndex ?? 0,
+        chunk_count: input.chunkCount ?? 1,
         positions: input.positions ?? [],
         positions_uri: null,
       },
@@ -137,11 +140,11 @@ describe('Reconciliation (e2e)', () => {
   });
 
   it('replays a treasury delta that arrived after the snapshot watermark', async () => {
-    // The classic lost update on reconciliation. Before ADR-026 the replay
-    // predicate was `treasury_event_seq > included_through_event_seq` while
-    // nothing ever wrote treasury_event_seq — always NULL, `NULL > n` is NULL,
-    // so the TREASURY branch never matched and the baseline silently erased
-    // every delta the snapshot had not yet folded in.
+    // Pins the guard against the classic lost update on reconciliation
+    // (ADR-06). The replay predicate is
+    // `treasury_event_seq > included_through_event_seq`, so that column must
+    // be populated: NULL makes the TREASURY branch unsatisfiable — `NULL > n`
+    // is NULL — and the baseline erases every delta not yet folded in.
     const programRef = await createProgram('PRG-RECON-DELTA');
 
     await publish({
@@ -177,10 +180,9 @@ describe('Reconciliation (e2e)', () => {
     }, 'the baseline to be applied');
 
     // 1000 (treasury) + 500 (our unacknowledged delta) = 1500.
-    // The old behaviour produced 1000, exposing 500 of capacity that was in
-    // fact reserved — and `v_program_ledger_drift` could not detect it,
-    // because the correcting ledger entry kept counter and ledger consistent
-    // on the wrong number.
+    // A bare 1000 would expose 500 of capacity that is in fact reserved, and
+    // `v_program_ledger_drift` cannot detect that, because the correcting
+    // ledger entry keeps counter and ledger consistent on the wrong number.
     expect(program.reservedAmount.toFixed(2)).toBe('1500.00');
 
     const baseline = await prisma.capacityLedgerEntry.findFirstOrThrow({
@@ -190,10 +192,9 @@ describe('Reconciliation (e2e)', () => {
   });
 
   it('falls back to a time window when the snapshot omits the ack watermark', async () => {
-    // ADR-004/005 promised exactly this fallback and no code implemented it:
-    // a missing watermark meant ackSeq = 0, i.e. replay every API entry ever
-    // recorded, double-counting the whole history into a snapshot that
-    // already contained it.
+    // ADR-06's fallback. A missing watermark must not be read as ackSeq = 0,
+    // which replays every API entry ever recorded and double-counts the whole
+    // history into a snapshot that already contains it.
     const programRef = await createProgram('PRG-RECON-FALLBACK');
 
     await publish({
@@ -260,8 +261,8 @@ describe('Reconciliation (e2e)', () => {
       }),
     );
 
-    // ADR-011 claimed discrepancies were "visible and auditable"; nothing read
-    // the table — no endpoint, no log, no alert.
+    // Pins that a recorded discrepancy is actually reachable by an operator
+    // over HTTP — "visible and auditable" needs a reader (ADR-07).
     const body = await waitFor(async () => {
       const res = await request(app.getHttpServer() as App)
         .get(`/programs/${programRef}/discrepancies`)
@@ -286,12 +287,83 @@ describe('Reconciliation (e2e)', () => {
       .expect(401);
   });
 
+  it('holds back a multi-chunk snapshot when one chunk is merely redelivered', async () => {
+    // Delivery is at-least-once, so the same chunk arrives more than once as a
+    // matter of course. Completeness is therefore the set of chunk indexes
+    // seen, never a count of messages: counting would let three copies of
+    // chunk 0 satisfy a three-chunk snapshot, and the positions carried by the
+    // chunks that never arrived would be silently absent from reconciliation
+    // while the snapshot was marked done and its sequence advanced.
+    const programRef = await createProgram('PRG-RECON-CHUNK', '1000.00');
+    const snapshotId = `SNAP-${randomUUID()}`;
+
+    for (let i = 0; i < 3; i += 1) {
+      await publish(
+        snapshotEvent({
+          programRef,
+          totalLimit: '4242.00',
+          reservedAmount: '42.00',
+          acknowledgedLocalSeq: null,
+          includedThroughEventSeq: null,
+          snapshotId,
+          chunkIndex: 0,
+          chunkCount: 3,
+        }),
+      );
+    }
+
+    // Wait out several worker ticks: this asserts that nothing happens, so it
+    // has to give the worker every chance to act before concluding it did not.
+    await new Promise((resolve) => setTimeout(resolve, 8_000));
+
+    const job = await prisma.reconciliationJob.findUniqueOrThrow({ where: { snapshotId } });
+    expect(job.receivedChunks).toEqual([0]);
+    expect(job.status).toBe('PENDING');
+
+    const program = await prisma.program.findUniqueOrThrow({ where: { externalRef: programRef } });
+    expect(program.totalLimit.toFixed(2)).toBe('1000.00');
+    expect(program.reservedAmount.toFixed(2)).toBe('0.00');
+  });
+
+  it('applies a multi-chunk snapshot once every distinct chunk has arrived', async () => {
+    const programRef = await createProgram('PRG-RECON-CHUNK-OK', '1000.00');
+    const snapshotId = `SNAP-${randomUUID()}`;
+
+    // Chunk 1 is sent twice to prove a duplicate neither blocks completion nor
+    // stands in for a chunk that is still missing.
+    for (const chunkIndex of [0, 1, 1, 2]) {
+      await publish(
+        snapshotEvent({
+          programRef,
+          totalLimit: '4242.00',
+          reservedAmount: '42.00',
+          acknowledgedLocalSeq: null,
+          includedThroughEventSeq: null,
+          snapshotId,
+          chunkIndex,
+          chunkCount: 3,
+        }),
+      );
+    }
+
+    const program = await waitFor(async () => {
+      const row = await prisma.program.findUniqueOrThrow({ where: { externalRef: programRef } });
+      return row.totalLimit.equals(4242) ? row : null;
+    }, 'the complete multi-chunk snapshot to be applied');
+
+    expect(program.totalLimit.toFixed(2)).toBe('4242.00');
+    expect(program.reservedAmount.toFixed(2)).toBe('42.00');
+
+    const job = await prisma.reconciliationJob.findUniqueOrThrow({ where: { snapshotId } });
+    expect([...job.receivedChunks].sort((a, b) => a - b)).toEqual([0, 1, 2]);
+  });
+
   it('publishes an outbox event for a release, not only for a reservation', async () => {
     // The acknowledgement watermark is "the highest local seq treasury has
-    // folded in". That is only meaningful if every local seq is published —
-    // and releases allocated a ledger seq while publishing nothing, so
-    // treasury could acknowledge past a release it had never seen and
-    // reconciliation would restore capacity that had in fact been returned.
+    // folded in", which is only meaningful if every local seq is published.
+    // A release that allocates a ledger seq but publishes nothing lets
+    // treasury acknowledge past a release it never saw, and reconciliation
+    // then restores capacity that had in fact been returned.
     const programRef = await createProgram('PRG-RECON-OUTBOX', '1000.00');
     const invoiceRef = `INV-${randomUUID()}`;
 

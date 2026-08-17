@@ -1,19 +1,21 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { Kafka, Producer } from 'kafkajs';
 import { ConfigService } from '@nestjs/config';
-import { Prisma } from '@prisma/client';
+import { OutboxStatus, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import type { Env } from '../config/env.schema';
 
 const POLL_INTERVAL_MS = 1_000;
 const BATCH_SIZE = 50;
 /// After this many failed publish attempts a row is parked in FAILED rather
-/// than retried forever. `attempts` was previously incremented and never read,
-/// and the FAILED enum value existed but was never written — so a permanently
-/// unpublishable row was retried once a second indefinitely, and (because the
-/// batch is ordered by created_at and capped at 50) permanently starved every
-/// newer message behind it.
+/// than retried forever. The batch is ordered by created_at and capped at 50,
+/// so a permanently unpublishable row retried once a second would starve every
+/// newer message behind it indefinitely.
 const MAX_ATTEMPTS = 8;
+
+/// Ceiling on the exponential backoff, so a long-failing row still gets
+/// retried at a predictable interval rather than drifting into hours.
+const MAX_BACKOFF_SECONDS = 300;
 
 interface ClaimedMessage {
   id: string;
@@ -48,10 +50,10 @@ export class OutboxRelayService implements OnModuleInit, OnModuleDestroy {
     });
     this.producer = kafka.producer({ idempotent: true });
 
-    // Connect lazily and never at boot: an unreachable broker used to reject
-    // onModuleInit, which aborts NestFactory.create and takes the whole HTTP
-    // API down with it — even though reserve/release/availability touch only
-    // Postgres. Publication is meant to be the deferrable part.
+    // Connect lazily and never at boot: a rejection from onModuleInit aborts
+    // NestFactory.create and takes the whole HTTP API down with it — even
+    // though reserve/release/availability touch only Postgres. Publication is
+    // the deferrable part.
     this.producer.connect().catch((err: unknown) => {
       this.logger.warn(
         `Producer connect failed, will retry on the next relay tick: ${String(err)}`,
@@ -74,8 +76,8 @@ export class OutboxRelayService implements OnModuleInit, OnModuleDestroy {
   }
 
   /// Re-entrancy guard: setInterval fires on a fixed schedule regardless of
-  /// whether the previous run finished. A batch slower than the interval used
-  /// to overlap with itself and publish the same rows twice from a single
+  /// whether the previous run finished, so a batch slower than the interval
+  /// would overlap with itself and publish the same rows twice from a single
   /// instance.
   private async tick(): Promise<void> {
     if (this.running || this.stopping) return;
@@ -134,16 +136,18 @@ export class OutboxRelayService implements OnModuleInit, OnModuleDestroy {
       // Guarded on PENDING so a concurrent claim cannot resurrect a row that
       // another path already settled.
       await this.prisma.outboxMessage.updateMany({
-        where: { id: message.id, status: 'PENDING' },
-        data: { status: 'SENT', sentAt: new Date() },
+        where: { id: message.id, status: OutboxStatus.PENDING },
+        data: { status: OutboxStatus.SENT, sentAt: new Date() },
       });
       return true;
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       const exhausted = message.attempts >= MAX_ATTEMPTS;
       await this.prisma.outboxMessage.updateMany({
-        where: { id: message.id, status: 'PENDING' },
-        data: exhausted ? { status: 'FAILED', lastError: reason } : { lastError: reason },
+        where: { id: message.id, status: OutboxStatus.PENDING },
+        data: exhausted
+          ? { status: OutboxStatus.FAILED, lastError: reason }
+          : { lastError: reason },
       });
       this.logger.warn(
         exhausted
@@ -162,10 +166,12 @@ export class OutboxRelayService implements OnModuleInit, OnModuleDestroy {
     return this.prisma.$queryRaw<ClaimedMessage[]>`
       UPDATE outbox_message m
          SET attempts = m.attempts + 1,
-             available_at = now() + make_interval(secs => least(power(2, m.attempts)::int, 300))
+             available_at = now() + make_interval(
+               secs => least(power(2, m.attempts)::int, ${MAX_BACKOFF_SECONDS})
+             )
        WHERE m.id IN (
          SELECT id FROM outbox_message
-          WHERE status = 'PENDING' AND available_at <= now()
+          WHERE status = ${OutboxStatus.PENDING}::"OutboxStatus" AND available_at <= now()
           ORDER BY created_at
           LIMIT ${BATCH_SIZE}
           FOR UPDATE SKIP LOCKED

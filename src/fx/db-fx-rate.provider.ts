@@ -24,10 +24,10 @@ export class DbFxRateProvider implements FxRateProvider {
   }
 
   /// `at` is the valuation instant. It is supplied by the caller as *server*
-  /// time — never a client-controlled timestamp. Letting a request body pick
-  /// the valuation instant let a caller choose which historical rate priced
-  /// its reservation, and the chosen rate is then frozen onto the invoice and
-  /// replayed at release, so the mispricing was permanent. See ADR-019.
+  /// time — never a client-controlled timestamp. A request body that picked
+  /// the valuation instant would choose which historical rate prices the
+  /// reservation, and the chosen rate is then frozen onto the invoice and
+  /// replayed at release, so the mispricing would be permanent. See ADR-03.
   async resolve(base: string, quote: string, at: Date): Promise<ResolvedRate> {
     const direct = await this.newestUsable(base, quote, at);
     if (direct) {
@@ -83,8 +83,8 @@ export class DbFxRateProvider implements FxRateProvider {
   }
 
   /// Newest rate that is not in the future and whose explicit validity window
-  /// (if any) still covers `at`. `valid_until` was previously a column nothing
-  /// read at all.
+  /// (if any) still covers `at` — `valid_until` bounds a rate's usable life
+  /// and is honoured here, the only place it is read.
   private newestUsable(base: string, quote: string, at: Date): Promise<FxRate | null> {
     return this.prisma.fxRate.findFirst({
       where: {

@@ -25,10 +25,10 @@ async function waitFor<T>(
   }
 }
 
-/// Before this spec existed, nothing in the suite produced or consumed a
-/// single Kafka message — the README claimed `test:e2e` exercised "real
-/// Kafka", but the broker was only needed for the app to boot. Every defect in
-/// the consumer, the dead-letter path and the inbox was invisible to CI.
+/// Exercises the consumer against a real broker: a message is produced,
+/// consumed, and its effect on the inbox, the ledger and the dead-letter path
+/// asserted. Booting the app against Kafka proves nothing on its own — defects
+/// in the consumer are only observable with traffic actually flowing.
 describe('Kafka capacity consumer (e2e)', () => {
   let app: INestApplication;
   let prisma: PrismaService;
@@ -121,9 +121,9 @@ describe('Kafka capacity consumer (e2e)', () => {
     });
     await publish(JSON.stringify(event));
 
-    // treasury_event_seq was written by nothing at all, which left the
-    // TREASURY branch of reconciliation's replay permanently unsatisfiable —
-    // `NULL > n` is NULL — so baselines silently erased treasury deltas.
+    // Pins that treasury_event_seq is populated. Reconciliation's TREASURY
+    // replay predicate is `treasury_event_seq > included_through_event_seq`,
+    // and `NULL > n` is NULL, so a missing seq lets a baseline erase the delta.
     const entry = await waitFor(
       () => prisma.capacityLedgerEntry.findUnique({ where: { eventId: event.event_id } }),
       'the treasury ledger entry',
@@ -151,11 +151,11 @@ describe('Kafka capacity consumer (e2e)', () => {
   });
 
   it('dead-letters an unparseable message instead of blocking the partition', async () => {
-    // The dead-letter writer used to run JSON.parse on the very payload that
-    // had just failed to parse. It threw inside the DLQ path, the exception
-    // escaped eachBatch, kafkajs retried the batch forever and the offset
-    // never advanced — one byte of rubbish stopped all consumption, and there
-    // was not even a dead-letter row to show for it.
+    // Pins that a malformed payload is stored rather than crashing the writer:
+    // the dead-letter path must never itself parse the body it is quarantining.
+    // If it throws, the exception escapes eachBatch, kafkajs retries the batch
+    // forever and the offset never advances — one byte of rubbish stops all
+    // consumption, with not even a dead-letter row to show for it.
     await publish(Buffer.from(`not-json-${randomUUID()}`, 'utf8'));
 
     await waitFor(async () => {
@@ -171,9 +171,9 @@ describe('Kafka capacity consumer (e2e)', () => {
   });
 
   it('dead-letters a delta whose currency contradicts the programme', async () => {
-    // The programme is GBP. A USD amount added 1:1 to reserved_amount used to
-    // be booked without comment — the schema validated delta.currency and the
-    // handler then never read it.
+    // The programme is GBP. delta.currency must be enforced by the handler and
+    // not merely validated by the schema: a USD amount added 1:1 to
+    // reserved_amount books capacity at a figure nobody computed.
     const before = await reservedAmount();
     const dlqBefore = await prisma.deadLetterMessage.count({ where: { topic: TOPIC } });
 
@@ -193,8 +193,8 @@ describe('Kafka capacity consumer (e2e)', () => {
   });
 
   it('dead-letters a delta that would breach the programme limit', async () => {
-    // Previously this hit the program_no_overcommit CHECK, was classified as
-    // "transient" and retried identically forever.
+    // A program_no_overcommit CHECK breach is permanent, not transient: the
+    // identical delta can only fail again, so it must be dead-lettered.
     const before = await reservedAmount();
 
     await publish(

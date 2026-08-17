@@ -36,13 +36,13 @@ export class DeadLetterService {
 /// The dead-letter table exists precisely to hold messages that could not be
 /// parsed — so parsing must not be able to fail here.
 ///
-/// The previous implementation called `JSON.parse(message.value?.toString() ?? 'null')`
-/// unguarded. For a non-JSON payload it threw *inside* the DLQ writer; that
-/// escaped `handleOne` and `eachBatch`, kafkajs retried the batch forever, the
-/// offset never advanced, and one byte of malformed input stopped all
-/// consumption permanently — with no dead-letter row to show for it. A
-/// tombstone (`value: null`) reached the same dead end via the JSONB NOT NULL
-/// constraint. See docs/DECISIONS.md ADR-025.
+/// A throw inside the DLQ writer escapes `handleOne` and `eachBatch`, kafkajs
+/// retries the batch forever, the offset never advances, and one byte of
+/// malformed input stops all consumption permanently — with no dead-letter row
+/// to show for it. Every unparseable shape therefore has a storable
+/// representation: a non-JSON payload, a tombstone (`value: null`) and a
+/// literal JSON `null` (which the JSONB NOT NULL constraint rejects) all
+/// become an `__unparsed` envelope. See docs/DECISIONS.md ADR-10.
 function toStorablePayload(message: KafkaMessage): Prisma.InputJsonValue {
   if (message.value === null || message.value === undefined) {
     return { __unparsed: true, reason: 'tombstone', raw: null };

@@ -83,11 +83,11 @@ describe('AuthService', () => {
     });
   });
 
-  // The status code was never the leak; the latency was. An unknown address
-  // short-circuited before the KDF ran, so it answered ~80x faster than a
-  // known one. Asserting on wall-clock time would be flaky, so assert on the
-  // observable cause instead: no user row is fetched, yet the rejection still
-  // took the same code path.
+  // The enumeration oracle here is latency, not the status code: short-circuiting
+  // on an unknown address skips the KDF and answers roughly 80x faster than a
+  // known one. Asserting on wall-clock time would be flaky, so this pins the
+  // observable cause instead — no user row is found, yet the rejection still
+  // pays for the same key derivation.
   it('rejects an unknown e-mail without revealing it through a fast path', async () => {
     findUnique.mockResolvedValue(null);
 

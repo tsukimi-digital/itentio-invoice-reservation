@@ -10,6 +10,7 @@ import { CapacityModule } from './capacity/capacity.module';
 import { OutboxModule } from './outbox/outbox.module';
 import { KafkaModule } from './kafka/kafka.module';
 import { ReconciliationModule } from './reconciliation/reconciliation.module';
+import { DEFAULT_RATE_LIMIT, DEFAULT_THROTTLER, RATE_LIMIT_WINDOW_MS } from './config/rate-limits';
 
 @Module({
   imports: [
@@ -21,7 +22,9 @@ import { ReconciliationModule } from './reconciliation/reconciliation.module';
     // with @Throttle({ default: {...} }) — see AuthController.login for the
     // stricter override (brute-force protection on the one endpoint that
     // doesn't require a token to hit).
-    ThrottlerModule.forRoot([{ name: 'default', ttl: 60_000, limit: 100 }]),
+    ThrottlerModule.forRoot([
+      { name: DEFAULT_THROTTLER, ttl: RATE_LIMIT_WINDOW_MS, limit: DEFAULT_RATE_LIMIT },
+    ]),
     PrismaModule,
     HealthModule,
     AuthModule,

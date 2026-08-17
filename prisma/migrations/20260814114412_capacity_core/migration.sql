@@ -344,7 +344,7 @@ ALTER TABLE "reconciliation_job" ADD CONSTRAINT "reconciliation_job_program_id_f
 ALTER TABLE "reconciliation_snapshot_position" ADD CONSTRAINT "reconciliation_snapshot_position_job_id_fkey" FOREIGN KEY ("job_id") REFERENCES "reconciliation_job"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 
 -- Hand-edited additions below this line: DB-level guarantees not expressible
--- in the Prisma schema DSL. See docs/DECISIONS.md ADR-001, ADR-006, ADR-011.
+-- in the Prisma schema DSL. See docs/DECISIONS.md ADR-02, ADR-04, ADR-07.
 
 ALTER TABLE program
   ADD CONSTRAINT program_reserved_non_negative CHECK (reserved_amount >= 0),

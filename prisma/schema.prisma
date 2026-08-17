@@ -8,8 +8,8 @@ datasource db {
 }
 
 // Money columns: numeric(24,4). Scale 4 covers every live ISO-4217 minor-unit
-// exponent (0/2/3/4) with one column type — see docs/DECISIONS.md ADR-001.
-// Rate columns: numeric(24,12) — see ADR-010.
+// exponent (0/2/3/4) with one column type — see docs/DECISIONS.md ADR-02.
+// Rate columns: numeric(24,12) — see ADR-02.
 
 enum ProgramStatus {
   ACTIVE
@@ -230,11 +230,11 @@ model ProcessedMessage {
 
   /// Deliberately an index, NOT a unique constraint. Dedup is keyed on the
   /// producer-supplied `event_id`, which survives topic recreation; Kafka
-  /// offsets do not. A unique constraint here meant that after any offset
-  /// reset (e.g. `docker compose down`, which wipes the broker because only
-  /// Postgres has a volume) the first new event collided on a triple that
+  /// offsets do not. A unique constraint here would let the first event after
+  /// any offset reset (e.g. `docker compose down`, which wipes the broker
+  /// because only Postgres has a volume) collide on a triple that
   /// `ON CONFLICT (event_id)` does not cover, aborting the transaction and
-  /// wedging the partition permanently. See docs/DECISIONS.md ADR-023.
+  /// wedging the partition permanently. See docs/DECISIONS.md ADR-05.
   @@index([topic, partition, offset])
   @@index([receivedAt])
   @@map("processed_message")
@@ -270,9 +270,15 @@ model ReconciliationJob {
   snapshotSeq BigInt   @map("snapshot_seq")
   asOf        DateTime @db.Timestamptz(6)
 
-  chunkCount     Int @map("chunk_count") @default(1)
-  chunksReceived Int @map("chunks_received") @default(0)
-  positionCount  Int @map("position_count") @default(0)
+  chunkCount Int @map("chunk_count") @default(1)
+
+  /// The DISTINCT chunk indexes received so far, not a count of messages.
+  /// Delivery is at-least-once, so the same chunk can arrive repeatedly; a
+  /// counter cannot tell three copies of chunk 0 from chunks 0, 1 and 2, and
+  /// would let an incomplete snapshot be treated as whole.
+  receivedChunks Int[] @map("received_chunks") @default([])
+
+  positionCount Int @map("position_count") @default(0)
 
   status      ReconciliationStatus @default(PENDING)
   attempts    Int      @default(0)
@@ -400,8 +406,8 @@ model OutboxMessage {
   /// Claim/backoff marker. The relay pushes this forward in the same
   /// statement that increments `attempts`, so a claimed row is invisible to
   /// other workers (and to the same worker's next tick) until its backoff
-  /// elapses. Without it the relay re-selected the same failing rows every
-  /// second and starved everything behind them.
+  /// elapses. Without it the relay re-selects the same failing rows every
+  /// tick and starves everything queued behind them.
   availableAt DateTime @default(now()) @map("available_at") @db.Timestamptz(6)
 
   createdAt DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)

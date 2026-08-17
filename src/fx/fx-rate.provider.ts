@@ -1,3 +1,4 @@
+import type { FxRateSource } from '@prisma/client';
 import type { Dec } from '../money/decimal';
 
 export interface ResolvedRate {
@@ -5,7 +6,7 @@ export interface ResolvedRate {
   rate: Dec;
   inverted: boolean;
   pivot: string | null;
-  source: 'SEED' | 'IDENTITY' | 'ECB' | 'TREASURY';
+  source: FxRateSource;
   asOf: Date;
 }
 

@@ -8,12 +8,11 @@ import { configureApp } from '../src/bootstrap';
 import { PrismaService } from '../src/prisma/prisma.service';
 import { hashPassword } from '../src/auth/password';
 
-/// The assignment's one explicitly highlighted requirement — "Programs and
-/// invoices may be denominated in different currencies" — had no end-to-end
-/// coverage at all: every spec used GBP for both sides, and DbFxRateProvider
-/// was never executed by any test (the concurrency spec deliberately injects a
-/// provider that throws). That gap is why the quantisation defect in ADR-020
-/// survived: with GBP -> GBP it is invisible.
+/// End-to-end cover for the assignment's one explicitly highlighted
+/// requirement — "Programs and invoices may be denominated in different
+/// currencies" — and the only spec that executes DbFxRateProvider (the
+/// concurrency spec deliberately injects a provider that throws). The
+/// quantisation rules in ADR-02 are invisible with GBP -> GBP on both sides.
 describe('Cross-currency reservation (e2e)', () => {
   let app: INestApplication;
   let prisma: PrismaService;
@@ -112,8 +111,8 @@ describe('Cross-currency reservation (e2e)', () => {
     const invoiceRef = `INV-${randomUUID()}`;
 
     // 1234.56 GBP / 0.0052 = 237415.3846... -> 237415 JPY (HALF_EVEN, 0 dp).
-    // Quantising the face amount at the PROGRAMME's scale first gave
-    // Money.of('1234.56','GBP',0) = 1235, hence 1235 / 0.0052 = 237500 JPY:
+    // The face amount is quantised at the INVOICE's scale, never the
+    // programme's: Money.of('1234.56','GBP',0) = 1235 converts to 237500 JPY,
     // 85 JPY of capacity consumed that nobody asked for, on every invoice.
     const res = await request(app.getHttpServer() as App)
       .post(`/programs/${programRef}/reserve`)
@@ -167,7 +166,7 @@ describe('Cross-currency reservation (e2e)', () => {
 
     const after = await availability();
     // Zero drift by construction: release replays the frozen amount rather
-    // than reconverting at a new rate (ADR-003).
+    // than reconverting at a new rate (ADR-03).
     expect((after.body as { available: string }).available).toBe(
       (before.body as { available: string }).available,
     );
@@ -175,7 +174,8 @@ describe('Cross-currency reservation (e2e)', () => {
 
   it('rejects an amount carrying more precision than the invoice currency allows', async () => {
     // JPY has no minor units. 1000.5 JPY is malformed input, not a rounding
-    // opportunity — and it used to reach a CHECK constraint and surface as 500.
+    // opportunity — rejected at the edge rather than left to a CHECK
+    // constraint, which would surface as a 500.
     await request(app.getHttpServer() as App)
       .post(`/programs/${programRef}/reserve`)
       .set(auth())
@@ -190,9 +190,9 @@ describe('Cross-currency reservation (e2e)', () => {
   });
 
   it('refuses a stale rate rather than pricing against it silently', async () => {
-    // The only CHF -> JPY rate on file is from 2019. `valid_until` existed in
-    // the schema and was read by nothing, and there was no maximum age at all,
-    // so a rate of any vintage priced a reservation without comment.
+    // The only CHF -> JPY rate on file is from 2019. Rate age is enforced —
+    // `valid_until` and a maximum age — so a rate of any vintage refuses to
+    // price a reservation instead of doing so without comment.
     const res = await request(app.getHttpServer() as App)
       .post(`/programs/${programRef}/reserve`)
       .set(auth())
@@ -260,10 +260,10 @@ describe('Cross-currency reservation (e2e)', () => {
   });
 
   it('does not let the client choose the FX rate through requestedAt', async () => {
-    // requestedAt is business metadata now; the valuation instant is server
-    // time. A caller backdating the request used to select an older, more
-    // favourable rate, and that rate was then frozen onto the invoice and
-    // replayed at release, making the mispricing permanent.
+    // requestedAt is business metadata; the valuation instant is server time.
+    // Otherwise a caller backdating the request selects an older, more
+    // favourable rate — and that rate is frozen onto the invoice and replayed
+    // at release, making the mispricing permanent.
     const backdated = `INV-${randomUUID()}`;
     const current = `INV-${randomUUID()}`;
     const body = { amount: '500.00', currency: 'GBP' };

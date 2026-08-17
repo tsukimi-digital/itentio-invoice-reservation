@@ -81,10 +81,10 @@ describe('CapacityService.reserve', () => {
     ).rejects.toThrow(InsufficientCapacityException);
   });
 
-  // Regression for ADR-020. Previously the face amount was quantised with the
-  // PROGRAMME currency's minor units, so a GBP invoice against a JPY
-  // programme (minorUnits 0) was silently rounded 1234.56 -> 1235 before
-  // conversion, over-reserving capacity and persisting a false face amount.
+  // Guards ADR-02. Quantising the face amount with the PROGRAMME currency's
+  // minor units would silently round a GBP invoice against a JPY programme
+  // (minorUnits 0) from 1234.56 to 1235 before conversion, over-reserving
+  // capacity and persisting a false face amount.
   describe('cross-currency quantisation', () => {
     function buildHarness(invoiceMinorUnits: number) {
       const invoiceCreate = jest.fn().mockResolvedValue({ id: 'inv1' });

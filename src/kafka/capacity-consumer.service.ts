@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../prisma/prisma.service';
 import { CapacityService } from '../capacity/capacity.service';
-import { capacityEventEnvelope, SnapshotEvent } from './schemas/capacity-event.schema';
+import { capacityEventEnvelope, EVENT_TYPE, SnapshotEvent } from './schemas/capacity-event.schema';
 import { DeadLetterService } from './dead-letter.service';
 import { isTransientDbError } from '../common/db-errors';
 import type { Env } from '../config/env.schema';
@@ -19,7 +19,7 @@ const MAX_TRANSIENT_ATTEMPTS = 5;
 const CONNECT_RETRY_MS = 5_000;
 
 /// At-least-once consumption + idempotent DB writes, never Kafka EOS — see
-/// docs/DECISIONS.md ADR-007/008. A bulk snapshot is never applied inline
+/// docs/DECISIONS.md ADR-05. A bulk snapshot is never applied inline
 /// here; it's parked as a ReconciliationJob and applied by a separate
 /// worker in bounded chunks, so a long reconciliation never risks a
 /// consumer rebalance (kafkajs has no max.poll.interval.ms — heartbeat()
@@ -57,11 +57,11 @@ export class CapacityConsumerService implements OnModuleInit, OnModuleDestroy {
       brokers: this.config.get('KAFKA_BROKERS', { infer: true }),
     });
 
-    // Started in the background and never awaited. `admin.connect()` used to
-    // sit unguarded in onModuleInit, so an unreachable broker rejected module
-    // initialisation, aborted NestFactory.create and took the entire HTTP API
-    // down — including reserve, release and availability, which touch only
-    // Postgres. See docs/DECISIONS.md ADR-027.
+    // Started in the background and never awaited: a rejection from
+    // `admin.connect()` inside onModuleInit would abort NestFactory.create and
+    // take the entire HTTP API down with it — including reserve, release and
+    // availability, which touch only Postgres. Kafka is the deferrable part.
+    // See docs/DECISIONS.md ADR-05.
     void this.startWithRetry();
   }
 
@@ -138,7 +138,7 @@ export class CapacityConsumerService implements OnModuleInit, OnModuleDestroy {
   /// anyway: it is unprocessable regardless of the DLQ's state, and blocking
   /// the partition on it turns the loss of one message into the loss of every
   /// message behind it. The `error`-level log is the only remaining trace, by
-  /// design. See docs/DECISIONS.md ADR-025.
+  /// design. See docs/DECISIONS.md ADR-10.
   private async deadLetter(
     topic: string,
     partition: number,
@@ -183,7 +183,7 @@ export class CapacityConsumerService implements OnModuleInit, OnModuleDestroy {
         `;
           if (claimed === 0) return;
 
-          if (parsed.event_type === 'program.capacity.snapshot') {
+          if (parsed.event_type === EVENT_TYPE.SNAPSHOT) {
             await this.enqueueReconciliationJob(tx, parsed);
           } else {
             await this.capacity.applyTreasuryDelta(tx, parsed);
@@ -199,8 +199,8 @@ export class CapacityConsumerService implements OnModuleInit, OnModuleDestroy {
 
   /// A permanent failure is dead-lettered immediately; a transient one is
   /// rethrown so kafkajs redelivers, but only up to a bound — an error
-  /// misclassified as transient would otherwise reproduce the original
-  /// head-of-line block.
+  /// misclassified as transient would otherwise block the head of the
+  /// partition indefinitely.
   private async handleProcessingFailure(
     topic: string,
     partition: number,
@@ -244,7 +244,10 @@ export class CapacityConsumerService implements OnModuleInit, OnModuleDestroy {
         snapshotSeq: s.snapshot_seq,
         asOf: new Date(s.as_of),
         chunkCount: s.chunk_count,
-        chunksReceived: 1,
+        // Left empty on purpose: the statement below records this chunk's
+        // index, and routing both the first and every later chunk through the
+        // same append keeps one rule instead of two that can disagree.
+        receivedChunks: [],
         positionCount: s.position_count,
         // Deliberately NOT a spread of `s` — s.positions carries raw bigint
         // local_ledger_seq fields that would break JSON serialisation, and
@@ -264,8 +267,20 @@ export class CapacityConsumerService implements OnModuleInit, OnModuleDestroy {
           program_currency: event.program_currency,
         },
       },
-      update: { chunksReceived: { increment: 1 } },
+      update: {},
     });
+
+    // Record the chunk index itself, and only if it is new. Counting messages
+    // instead would let the same chunk redelivered `chunk_count` times satisfy
+    // the completeness gate while the other chunks never arrived, applying a
+    // snapshot whose positions are mostly missing.
+    await tx.$executeRaw`
+      UPDATE reconciliation_job
+         SET received_chunks = CASE
+               WHEN ${s.chunk_index}::int = ANY(received_chunks) THEN received_chunks
+               ELSE array_append(received_chunks, ${s.chunk_index}::int)
+             END
+       WHERE snapshot_id = ${s.snapshot_id}`;
     if (s.positions.length > 0) {
       const job = await tx.reconciliationJob.findUniqueOrThrow({
         where: { snapshotId: s.snapshot_id },

@@ -1,41 +1,84 @@
 {
   "info": {
-    "_postman_id": "6b6e6e2a-6c9a-4f8a-9d0a-2f5b1d3c7a11",
-    "name": "Itentio — Program Capacity & Invoice Reservation",
-    "description": "Backend-only service (no frontend) — tracks a financing program's credit capacity in real time. See README.md and docs/DECISIONS.md in the repo for the full write-up.\n\n**Before you start:**\n1. `docker compose up -d && npm run prisma:generate && npx prisma migrate deploy && npx prisma db seed`\n2. `npm run start:dev` (http://localhost:3000)\n3. Open the **`0 · Setup`** folder in this collection and read its description — the API has no endpoint to *create* a program (that's an intentional scope decision, see README/ADR), so you need one raw SQL insert before `reserve`/`release`/availability calls will work.\n4. Run **`1 · Auth → Login`** once. Its test script captures both the access token and the refresh token into collection variables automatically — every other request inherits `accessToken` as a Bearer token.\n\nDefault seeded login: `admin@itentio.dev` / `dev-only-password-change-me` (role `ADMIN`).\n\n**Since the last update:** `reserve`/`release` now require role `ADMIN` or `OPERATOR` (the seeded admin qualifies; a `READER`-role user gets 403 — see docs/DECISIONS.md ADR-017). `POST /auth/login` is rate-limited to 5 requests/minute — hitting it repeatedly while testing will start returning 429. Access tokens expire after 1h; use **`1 · Auth → Refresh token`** to get a new pair without re-sending the password (ADR-018) — it rotates the refresh token on every use, so the old one stops working immediately.",
+    "name": "Program Capacity & Invoice Reservation",
+    "description": "Program capacity & invoice reservation — a backend-only service that tracks a\nfinancing programme's credit limit in real time.\n\n**Run it in three commands**\n\n1. `docker compose up -d && npm ci && npm run prisma:generate`\n2. `npx prisma migrate deploy && npx prisma db seed`\n3. `npm run start:dev`  (http://localhost:3000, Swagger at /docs)\n\nThe seed creates everything this collection needs — two programmes, four\ncurrencies, FX rates and an admin user. No manual SQL.\n\n**Then just press Run.** The collection is ordered so it can be executed\ntop-to-bottom by the Collection Runner: `Login` captures the tokens and mints a\nfresh `runId`, so every invoice reference is unique per run and the whole\ncollection is safe to re-run against the same database as often as you like.\nEvery request asserts its own status and payload, so a red result is a real\nfailure rather than something to interpret.\n\n**Seeded login:** `admin@itentio.dev` / `dev-only-password-change-me` (ADMIN).\n\n**Seeded programmes:** `PRG-1` (GBP, 10,000,000 limit) and `PRG-2` (JPY,\n1,500,000,000) — the second one exists so the cross-currency path can be driven\nwithout adding data by hand.\n\n**Worth knowing while testing:** `POST /auth/login` is rate limited to 5\nrequests/minute and everything else to 100/minute. Each full run of this\ncollection spends two of those five, so running it three times inside one minute\nwill be throttled — that is the service behaving correctly, and `Login` says so\nexplicitly rather than letting it surface as a cascade of 401s. Wait a minute\nand run again. Access tokens last 1h; `Refresh token` rotates the pair and\ninvalidates the old refresh token immediately.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "auth": {
     "type": "bearer",
-    "bearer": [{ "key": "token", "value": "{{accessToken}}", "type": "string" }]
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{accessToken}}",
+        "type": "string"
+      }
+    ]
   },
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// requestedAt is business metadata and must not be in the future, so it is",
+          "// a timestamp a minute in the past. It is set ONCE per run (by Login) and",
+          "// only seeded here as a fallback: regenerating it per request would change",
+          "// the body between a reservation and its replay, and an Idempotency-Key",
+          "// replayed with a different body is a 409, not a replay.",
+          "if (!pm.collectionVariables.get('requestedAt')) {",
+          "  pm.collectionVariables.set('requestedAt',",
+          "    new Date(Date.now() - 60000).toISOString());",
+          "}"
+        ]
+      }
+    }
+  ],
   "variable": [
-    { "key": "baseUrl", "value": "http://localhost:3000", "type": "string" },
-    { "key": "accessToken", "value": "", "type": "string" },
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:3000"
+    },
+    {
+      "key": "accessToken",
+      "value": ""
+    },
     {
       "key": "refreshToken",
-      "value": "",
-      "type": "string",
-      "description": "Saved automatically by Login and by Refresh token's test scripts."
+      "value": ""
+    },
+    {
+      "key": "staleRefreshToken",
+      "value": ""
     },
     {
       "key": "programRef",
-      "value": "PRG-DEMO",
-      "type": "string",
-      "description": "Must already exist — see the '0 · Setup' folder."
+      "value": "PRG-1"
     },
-    { "key": "invoiceRef", "value": "INV-DEMO-1", "type": "string" },
     {
-      "key": "idempotencyKey",
-      "value": "11111111-1111-4111-8111-111111111111",
-      "type": "string",
-      "description": "Fixed value used by the 'Reserve (idempotent replay demo)' request — send that request twice in a row to see the second call return the exact same response without creating a second reservation."
+      "key": "jpyProgramRef",
+      "value": "PRG-2"
+    },
+    {
+      "key": "runId",
+      "value": ""
+    },
+    {
+      "key": "requestedAt",
+      "value": ""
+    },
+    {
+      "key": "availableBefore",
+      "value": ""
+    },
+    {
+      "key": "replayBody",
+      "value": ""
     }
   ],
   "item": [
     {
-      "name": "0 · Setup",
-      "description": "The API deliberately exposes no endpoint to create a Program — that's an intentional scope decision (program creation is treated as back-office data entry, not part of the reserve/release/query surface; see README.md \"Trying it out\" and docs/DECISIONS.md). Create one directly in Postgres before using the requests below.\n\n**Option A — psql (matches docker-compose.yml credentials):**\n```\ndocker compose exec postgres psql -U itentio -d itentio -c \"\nINSERT INTO program (id, external_ref, name, currency_code, total_limit, updated_at)\nVALUES (gen_random_uuid(), 'PRG-DEMO', 'Postman demo', 'GBP', '10000.00', now())\nON CONFLICT (external_ref) DO NOTHING;\n\"\n```\n\n**Option B — Prisma Studio:** `npx prisma studio`, open the `Program` table, add a row with `externalRef = PRG-DEMO`, `currencyCode = GBP`, `totalLimit = 10000.00`.\n\nGBP, EUR, USD and JPY are already seeded as currencies by `npx prisma db seed`, so `PRG-DEMO` in GBP works out of the box. Change the `programRef` collection variable if you use a different external ref.",
+      "name": "0 · Setup (read me)",
+      "description": "Nothing to do here — `npx prisma db seed` already created it all. This folder\njust says what you are working with.\n\n**Programmes**\n- `PRG-1` — GBP, limit 10,000,000. The `programRef` variable points here.\n- `PRG-2` — JPY, limit 1,500,000,000. Used by the cross-currency folder: a GBP\n  invoice reserved against it comes back converted and rounded to whole yen.\n\n**Currencies and FX:** GBP, USD, EUR, JPY, with rates into GBP.\n\n**User:** `admin@itentio.dev` / `dev-only-password-change-me`, role ADMIN.\n\nThere is deliberately no endpoint that *creates* a programme — that is treated\nas back-office data entry rather than part of the reserve/release/query surface\n(docs/DECISIONS.md ADR-13). To add your own, use `npx prisma studio`.\n\n**Roles.** `reserve` and `release` require ADMIN or OPERATOR; availability is\nopen to any authenticated role; discrepancies are ADMIN-only. The seeded user is\nADMIN, so every request here succeeds. To see a 403, create a READER user in\nPrisma Studio and log in as them.",
       "item": []
     },
     {
@@ -43,96 +86,257 @@
       "item": [
         {
           "name": "Login",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/auth/login",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "auth",
+                "login"
+              ]
+            },
+            "description": "Exchanges credentials for an access token and a refresh token. Also mints a fresh `runId`, which every later request uses to build unique invoice references — that is what makes the collection safe to re-run against the same database.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"admin@itentio.dev\",\n  \"password\": \"dev-only-password-change-me\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
           "event": [
             {
               "listen": "test",
               "script": {
                 "type": "text/javascript",
                 "exec": [
-                  "pm.test('login succeeded', function () {",
-                  "  pm.response.to.have.status(200);",
-                  "});",
-                  "",
-                  "const body = pm.response.json();",
-                  "pm.test('response has an accessToken', function () {",
-                  "  pm.expect(body.accessToken).to.be.a('string');",
-                  "});",
-                  "pm.test('response has a refreshToken', function () {",
-                  "  pm.expect(body.refreshToken).to.be.a('string');",
-                  "});",
-                  "",
-                  "if (body.accessToken) {",
-                  "  pm.collectionVariables.set('accessToken', body.accessToken);",
-                  "  console.log('accessToken saved to collection variable');",
+                  "// Login allows 5 requests/minute and each full run spends two of them,",
+                  "// so a third run inside the same minute is throttled. Name that",
+                  "// explicitly — otherwise it surfaces as a confusing cascade of 401s.",
+                  "if (pm.response.code === 429) {",
+                  "  pm.test('RATE LIMITED — login allows 5/min; wait a minute and run again', () =>",
+                  "    pm.expect.fail('POST /auth/login returned 429'));",
+                  "  postman.setNextRequest(null);",
+                  "  return;",
                   "}",
-                  "if (body.refreshToken) {",
-                  "  pm.collectionVariables.set('refreshToken', body.refreshToken);",
-                  "  console.log('refreshToken saved to collection variable');",
-                  "}"
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "pm.test('returns an access token', () => pm.expect(b.accessToken).to.be.a('string').and.not.empty);",
+                  "pm.test('returns a refresh token', () => pm.expect(b.refreshToken).to.be.a('string').and.not.empty);",
+                  "pm.collectionVariables.set('accessToken', b.accessToken);",
+                  "pm.collectionVariables.set('refreshToken', b.refreshToken);",
+                  "// Fresh per run, so invoice refs never collide with a previous run.",
+                  "pm.collectionVariables.set('runId', Date.now().toString(36).toUpperCase());",
+                  "// Pinned for the whole run so a replayed body is byte-identical.",
+                  "pm.collectionVariables.set('requestedAt',",
+                  "  new Date(Date.now() - 60000).toISOString());"
                 ]
               }
             }
-          ],
+          ]
+        },
+        {
+          "name": "Login — wrong password",
           "request": {
-            "auth": { "type": "noauth" },
             "method": "POST",
-            "header": [{ "key": "Content-Type", "value": "application/json" }],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"email\": \"admin@itentio.dev\",\n  \"password\": \"dev-only-password-change-me\"\n}"
-            },
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
             "url": {
               "raw": "{{baseUrl}}/auth/login",
-              "host": ["{{baseUrl}}"],
-              "path": ["auth", "login"]
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "auth",
+                "login"
+              ]
             },
-            "description": "Seeded credentials from prisma/seed.ts (role ADMIN). Run this first — the test script stores both the access token and refresh token into collection variables. Rate-limited to 5 requests/minute — repeated wrong-password testing will start returning 429 before 401."
-          }
+            "description": "A wrong password and an unknown e-mail return exactly the same 401, and both pay the full key-derivation cost, so neither the status nor the response time reveals whether the account exists.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"admin@itentio.dev\",\n  \"password\": \"definitely-not-the-password\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// A 429 here means the login limiter, not a broken assertion.",
+                  "pm.test('401 Unauthorized (429 means the 5/min login limit was hit)', () =>",
+                  "  pm.response.to.have.status(401));",
+                  "pm.test('no token is issued', () => pm.expect(pm.response.json().accessToken).to.be.undefined);"
+                ]
+              }
+            }
+          ]
         },
         {
           "name": "Refresh token",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/auth/refresh",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "auth",
+                "refresh"
+              ]
+            },
+            "description": "Exchanges the refresh token for a new pair without re-sending the password. The presented token is revoked in the same transaction that mints its replacement, so it stops working immediately.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"refreshToken\": \"{{refreshToken}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
           "event": [
             {
               "listen": "test",
               "script": {
                 "type": "text/javascript",
                 "exec": [
-                  "pm.test('refresh succeeded', function () {",
-                  "  pm.response.to.have.status(200);",
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "pm.test('issues a new pair', () => {",
+                  "  pm.expect(b.accessToken).to.be.a('string').and.not.empty;",
+                  "  pm.expect(b.refreshToken).to.be.a('string').and.not.empty;",
                   "});",
-                  "",
-                  "const body = pm.response.json();",
-                  "pm.test('response has a new accessToken and refreshToken', function () {",
-                  "  pm.expect(body.accessToken).to.be.a('string');",
-                  "  pm.expect(body.refreshToken).to.be.a('string');",
-                  "});",
-                  "",
-                  "if (body.accessToken) pm.collectionVariables.set('accessToken', body.accessToken);",
-                  "if (body.refreshToken) pm.collectionVariables.set('refreshToken', body.refreshToken);"
+                  "pm.test('the refresh token actually rotated', () =>",
+                  "  pm.expect(b.refreshToken).to.not.eql(pm.collectionVariables.get('refreshToken')));",
+                  "// Keep the spent one so the next request can prove it is dead.",
+                  "pm.collectionVariables.set('staleRefreshToken', pm.collectionVariables.get('refreshToken'));",
+                  "pm.collectionVariables.set('accessToken', b.accessToken);",
+                  "pm.collectionVariables.set('refreshToken', b.refreshToken);"
                 ]
               }
             }
-          ],
+          ]
+        },
+        {
+          "name": "Refresh token — replay the spent one",
           "request": {
-            "auth": { "type": "noauth" },
             "method": "POST",
-            "header": [{ "key": "Content-Type", "value": "application/json" }],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"refreshToken\": \"{{refreshToken}}\"\n}"
-            },
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
             "url": {
               "raw": "{{baseUrl}}/auth/refresh",
-              "host": ["{{baseUrl}}"],
-              "path": ["auth", "refresh"]
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "auth",
+                "refresh"
+              ]
             },
-            "description": "Exchanges the refresh token for a new access+refresh pair — no password needed. Rotates on every use: the refresh token consumed here immediately stops working (docs/DECISIONS.md ADR-018), and the response's new refreshToken replaces it in the collection variable. Sending this request twice in a row with the same stored value will 401 the second time — that's expected, run Login again to get a fresh pair."
-          }
+            "description": "Replaying a rotated-away refresh token is treated as evidence of a leak: it is rejected, and every unrevoked token in that user's family is revoked as well.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"refreshToken\": \"{{staleRefreshToken}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('401 Unauthorized', () => pm.response.to.have.status(401));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Availability without a token",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{programRef}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{programRef}}"
+              ]
+            },
+            "description": "Every business endpoint sits behind a global JWT guard. Only /health, /auth/login and /auth/refresh are public.",
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('401 Unauthorized', () => pm.response.to.have.status(401));"
+                ]
+              }
+            }
+          ]
         }
       ]
     },
     {
-      "name": "2 · Capacity",
+      "name": "2 · Capacity — happy path",
       "item": [
         {
           "name": "Get availability",
@@ -141,98 +345,1131 @@
             "header": [],
             "url": {
               "raw": "{{baseUrl}}/programs/{{programRef}}",
-              "host": ["{{baseUrl}}"],
-              "path": ["programs", "{{programRef}}"]
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{programRef}}"
+              ]
             },
-            "description": "Returns { programRef, currency, totalLimit, reservedAmount, available } — amounts always as decimal strings (e.g. \"1000.00\"), never JSON numbers. Requires a Bearer token (401 without one)."
-          }
+            "description": "Current limit, reserved amount and remaining availability. All money is a fixed-scale string at the programme currency's minor units, never a JSON number."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "pm.test('reports the programme currency', () => pm.expect(b.currency).to.eql('GBP'));",
+                  "pm.test('money is a fixed-scale string', () => {",
+                  "  pm.expect(b.totalLimit).to.match(/^\\d+\\.\\d{2}$/);",
+                  "  pm.expect(b.available).to.match(/^\\d+\\.\\d{2}$/);",
+                  "});",
+                  "pm.test('available = limit - reserved', () =>",
+                  "  pm.expect(Number(b.available)).to.eql(Number(b.totalLimit) - Number(b.reservedAmount)));",
+                  "pm.collectionVariables.set('availableBefore', b.available);"
+                ]
+              }
+            }
+          ]
         },
         {
           "name": "Reserve capacity",
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Content-Type", "value": "application/json" },
               {
                 "key": "Idempotency-Key",
-                "value": "{{$guid}}",
-                "description": "A fresh UUID per send — normal usage. See the separate 'Reserve (idempotent replay demo)' request to see what happens when you reuse the same key."
+                "value": "{{runId}}-reserve-1"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
               }
             ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"invoiceRef\": \"{{invoiceRef}}\",\n  \"amount\": \"100.00\",\n  \"currency\": \"GBP\",\n  \"requestedAt\": \"{{$isoTimestamp}}\"\n}"
-            },
             "url": {
               "raw": "{{baseUrl}}/programs/{{programRef}}/reserve",
-              "host": ["{{baseUrl}}"],
-              "path": ["programs", "{{programRef}}", "reserve"]
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{programRef}}",
+                "reserve"
+              ]
             },
-            "description": "Reserves 100.00 GBP against PRG-DEMO for invoice {{invoiceRef}}. If the invoice currency differs from the program currency (try \"amount\": \"50.00\", \"currency\": \"EUR\"), the response's reservedAmount reflects the seeded FX rate applied and frozen at reservation time — see docs/DECISIONS.md ADR-003.\n\nChange `invoiceRef` (collection variable, or edit the body directly) between calls if you want several independent reservations against the same program rather than re-hitting the same invoice."
-          }
+            "description": "Reserves part of the programme's limit for an invoice. The Idempotency-Key is fixed for this run so the next request can replay it.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"invoiceRef\": \"INV-{{runId}}-1\",\n  \"amount\": \"1234.56\",\n  \"currency\": \"GBP\",\n  \"requestedAt\": \"{{requestedAt}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));",
+                  "const b = pm.response.json();",
+                  "pm.test('invoice is RESERVED', () => pm.expect(b.status).to.eql('RESERVED'));",
+                  "pm.test('books the face amount (same currency, no FX)', () =>",
+                  "  pm.expect(b.reservedAmount).to.eql('1234.56'));",
+                  "pm.collectionVariables.set('replayBody', JSON.stringify(b));"
+                ]
+              }
+            }
+          ]
         },
         {
-          "name": "Reserve (idempotent replay demo)",
+          "name": "Reserve — replay the same key and body",
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Content-Type", "value": "application/json" },
               {
                 "key": "Idempotency-Key",
-                "value": "{{idempotencyKey}}",
-                "description": "Fixed value (collection variable) — send this request twice in a row."
+                "value": "{{runId}}-reserve-1"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
               }
             ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"invoiceRef\": \"INV-IDEMPOTENCY-DEMO\",\n  \"amount\": \"25.00\",\n  \"currency\": \"GBP\",\n  \"requestedAt\": \"{{$isoTimestamp}}\"\n}"
-            },
             "url": {
               "raw": "{{baseUrl}}/programs/{{programRef}}/reserve",
-              "host": ["{{baseUrl}}"],
-              "path": ["programs", "{{programRef}}", "reserve"]
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{programRef}}",
+                "reserve"
+              ]
             },
-            "description": "Send this exact request twice in a row (same body, same Idempotency-Key). The second response is byte-identical to the first — no second reservation is created, and 'Get availability' won't show a second +25.00. This is the Idempotency-Key replay path (docs/DECISIONS.md — capacity.service.ts claimIdempotencyKey). To test it again later, either change the `idempotencyKey` collection variable to a new UUID, or change `invoiceRef` in the body — the business-key uniqueness on (program, invoice) is the durable guarantee that outlives the header's 24h TTL."
-          }
+            "description": "The same key with the same body returns the original response instead of reserving twice. Note the underlying guarantee is not the header but a uniqueness constraint on (programme, invoiceRef) — the header is a latency optimisation on top of it.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"invoiceRef\": \"INV-{{runId}}-1\",\n  \"amount\": \"1234.56\",\n  \"currency\": \"GBP\",\n  \"requestedAt\": \"{{requestedAt}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));",
+                  "const b = pm.response.json();",
+                  "const first = JSON.parse(pm.collectionVariables.get('replayBody'));",
+                  "pm.test('returns the original reservation, not a second one', () => {",
+                  "  pm.expect(b.invoiceId).to.eql(first.invoiceId);",
+                  "  pm.expect(b.reservedAmount).to.eql(first.reservedAmount);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get availability after reserving",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{programRef}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{programRef}}"
+              ]
+            },
+            "description": "Availability drops by exactly the reserved amount, and by it only once despite the replay above."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "const before = Number(pm.collectionVariables.get('availableBefore'));",
+                  "pm.test('dropped by exactly 1234.56, once', () =>",
+                  "  pm.expect(Number(b.available)).to.be.closeTo(before - 1234.56, 0.001));"
+                ]
+              }
+            }
+          ]
         },
         {
           "name": "Release capacity",
           "request": {
             "method": "POST",
             "header": [
-              { "key": "Content-Type", "value": "application/json" },
-              { "key": "Idempotency-Key", "value": "{{$guid}}" }
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
             ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"invoiceRef\": \"{{invoiceRef}}\"\n}"
-            },
             "url": {
               "raw": "{{baseUrl}}/programs/{{programRef}}/release",
-              "host": ["{{baseUrl}}"],
-              "path": ["programs", "{{programRef}}", "release"]
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{programRef}}",
+                "release"
+              ]
             },
-            "description": "Releases the reservation made for {{invoiceRef}} — returns exactly the frozen amount to available capacity (zero FX drift, even if the invoice was in a foreign currency). Releasing an already-released invoice is a no-op, not an error."
-          }
+            "description": "Repayment returns the reserved amount. Release replays the amount frozen on the invoice rather than recomputing it, which is what makes capacity return to exactly its prior level.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"invoiceRef\": \"INV-{{runId}}-1\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));",
+                  "pm.test('invoice is RELEASED', () => pm.expect(pm.response.json().status).to.eql('RELEASED'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get availability after releasing",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{programRef}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{programRef}}"
+              ]
+            },
+            "description": "Back to exactly the figure from before the reservation — no residue."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('restored to exactly the prior value', () =>",
+                  "  pm.expect(pm.response.json().available).to.eql(pm.collectionVariables.get('availableBefore')));"
+                ]
+              }
+            }
+          ]
         }
       ]
     },
     {
-      "name": "3 · Health",
+      "name": "3 · Capacity — cross-currency",
+      "item": [
+        {
+          "name": "Reserve a GBP invoice against the JPY programme",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{jpyProgramRef}}/reserve",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{jpyProgramRef}}",
+                "reserve"
+              ]
+            },
+            "description": "The invoice is in GBP, the programme in JPY. The rate is resolved at reservation time (here by inverting the seeded JPY→GBP rate), applied once, and the result is quantised to JPY's zero decimal places — so the booked amount is whole yen. The rate is then frozen on the invoice.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"invoiceRef\": \"INV-{{runId}}-FX\",\n  \"amount\": \"1000.00\",\n  \"currency\": \"GBP\",\n  \"requestedAt\": \"{{requestedAt}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));",
+                  "const b = pm.response.json();",
+                  "pm.test('booked in whole yen (no decimal part)', () =>",
+                  "  pm.expect(b.reservedAmount).to.match(/^\\d+$/));",
+                  "pm.test('converted, not copied across', () =>",
+                  "  pm.expect(Number(b.reservedAmount)).to.be.greaterThan(1000));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Release the cross-currency reservation",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{jpyProgramRef}}/release",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{jpyProgramRef}}",
+                "release"
+              ]
+            },
+            "description": "Releases the frozen programme-currency amount, so the JPY programme returns to precisely its prior availability rather than to today's rate.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"invoiceRef\": \"INV-{{runId}}-FX\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));",
+                  "pm.test('invoice is RELEASED', () => pm.expect(pm.response.json().status).to.eql('RELEASED'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Reject a JPY amount carrying decimals",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{jpyProgramRef}}/reserve",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{jpyProgramRef}}",
+                "reserve"
+              ]
+            },
+            "description": "JPY has no minor unit, so `1000.5` is malformed input rather than a rounding opportunity. It is refused instead of being booked as a different number.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"invoiceRef\": \"INV-{{runId}}-JPYDEC\",\n  \"amount\": \"1000.5\",\n  \"currency\": \"JPY\",\n  \"requestedAt\": \"{{requestedAt}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('400 Bad Request', () => pm.response.to.have.status(400));",
+                  "pm.test('says the amount is too precise for the currency', () =>",
+                  "  pm.expect(JSON.stringify(pm.response.json())).to.match(/precision|decimal/i));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "4 · Capacity — rejections",
+      "item": [
+        {
+          "name": "Reserve more than the limit",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{programRef}}/reserve",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{programRef}}",
+                "reserve"
+              ]
+            },
+            "description": "The capacity test lives in the WHERE clause of the debiting UPDATE, so there is no read-modify-write window: the programme can never be over-committed, no matter how many callers race.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"invoiceRef\": \"INV-{{runId}}-TOOBIG\",\n  \"amount\": \"99999999.00\",\n  \"currency\": \"GBP\",\n  \"requestedAt\": \"{{requestedAt}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('409 Conflict', () => pm.response.to.have.status(409));",
+                  "pm.test('identifies insufficient capacity', () =>",
+                  "  pm.expect(JSON.stringify(pm.response.json())).to.match(/INSUFFICIENT_CAPACITY|capacity/i));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Reserve an invoice (setup for the next request)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{programRef}}/reserve",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{programRef}}",
+                "reserve"
+              ]
+            },
+            "description": "Books INV-…-DUP at 100.00 so the next request can try to change its terms behind the same reference.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"invoiceRef\": \"INV-{{runId}}-DUP\",\n  \"amount\": \"100.00\",\n  \"currency\": \"GBP\",\n  \"requestedAt\": \"{{requestedAt}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));",
+                  "pm.test('booked at 100.00', () => pm.expect(pm.response.json().reservedAmount).to.eql('100.00'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Same invoiceRef, different amount",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{programRef}}/reserve",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{programRef}}",
+                "reserve"
+              ]
+            },
+            "description": "A fresh Idempotency-Key, but the same invoice reference carrying a different amount. Confirming the earlier reservation here would answer 201 with the ORIGINAL figure to a caller who asked for a different one, so it is a conflict instead.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"invoiceRef\": \"INV-{{runId}}-DUP\",\n  \"amount\": \"50000.00\",\n  \"currency\": \"GBP\",\n  \"requestedAt\": \"{{requestedAt}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('409 Conflict', () => pm.response.to.have.status(409));",
+                  "pm.test('names both amounts', () => {",
+                  "  const m = JSON.stringify(pm.response.json());",
+                  "  pm.expect(m).to.include('100.00');",
+                  "  pm.expect(m).to.include('50000.00');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Release the setup invoice",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{programRef}}/release",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{programRef}}",
+                "release"
+              ]
+            },
+            "description": "Tidies up so the run leaves no capacity held.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"invoiceRef\": \"INV-{{runId}}-DUP\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Idempotency-Key reused with a different body",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Idempotency-Key",
+                "value": "{{runId}}-reserve-1"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{programRef}}/reserve",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{programRef}}",
+                "reserve"
+              ]
+            },
+            "description": "That key was already settled against a different body earlier in this run. The fingerprint covers the method, the concrete URL and the body, so this is a conflict rather than a replay.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"invoiceRef\": \"INV-{{runId}}-OTHER\",\n  \"amount\": \"7.00\",\n  \"currency\": \"GBP\",\n  \"requestedAt\": \"{{requestedAt}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('409 Conflict', () => pm.response.to.have.status(409));",
+                  "pm.test('names the key reuse', () =>",
+                  "  pm.expect(JSON.stringify(pm.response.json())).to.match(/Idempotency-Key/i));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Reserve without an Idempotency-Key",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{programRef}}/reserve",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{programRef}}",
+                "reserve"
+              ]
+            },
+            "description": "The header is mandatory on both mutating endpoints.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"invoiceRef\": \"INV-{{runId}}-NOKEY\",\n  \"amount\": \"10.00\",\n  \"currency\": \"GBP\",\n  \"requestedAt\": \"{{requestedAt}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('400 Bad Request', () => pm.response.to.have.status(400));",
+                  "pm.test('says the header is required', () =>",
+                  "  pm.expect(JSON.stringify(pm.response.json())).to.match(/Idempotency-Key/i));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Negative amount",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{programRef}}/reserve",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{programRef}}",
+                "reserve"
+              ]
+            },
+            "description": "No sign is accepted. A negative amount would satisfy the guarded UPDATE's predicate and *lower* the reserved amount, so it is rejected at the edge rather than by a CHECK constraint three statements later.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"invoiceRef\": \"INV-{{runId}}-NEG\",\n  \"amount\": \"-100.00\",\n  \"currency\": \"GBP\",\n  \"requestedAt\": \"{{requestedAt}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('400 Bad Request', () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Zero amount",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{programRef}}/reserve",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{programRef}}",
+                "reserve"
+              ]
+            },
+            "description": "A reservation of nothing is not a valid instruction.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"invoiceRef\": \"INV-{{runId}}-ZERO\",\n  \"amount\": \"0.00\",\n  \"currency\": \"GBP\",\n  \"requestedAt\": \"{{requestedAt}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('400 Bad Request', () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Amount too precise for the currency",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{programRef}}/reserve",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{programRef}}",
+                "reserve"
+              ]
+            },
+            "description": "GBP has two decimal places; a third is malformed input, not something to round away silently.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"invoiceRef\": \"INV-{{runId}}-PREC\",\n  \"amount\": \"100.123\",\n  \"currency\": \"GBP\",\n  \"requestedAt\": \"{{requestedAt}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('400 Bad Request', () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Unknown currency",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{programRef}}/reserve",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{programRef}}",
+                "reserve"
+              ]
+            },
+            "description": "Currencies are a table, not a free-text field.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"invoiceRef\": \"INV-{{runId}}-XYZ\",\n  \"amount\": \"10.00\",\n  \"currency\": \"XYZ\",\n  \"requestedAt\": \"{{requestedAt}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('400 Bad Request', () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Injection attempt in invoiceRef",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{programRef}}/reserve",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{programRef}}",
+                "reserve"
+              ]
+            },
+            "description": "Every query is parameterised, so this was never going to execute — but it is still refused by validation rather than being stored. Run `Get availability` afterwards to confirm the service is unharmed.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"invoiceRef\": \"'; DROP TABLE program;--\",\n  \"amount\": \"10.00\",\n  \"currency\": \"GBP\",\n  \"requestedAt\": \"{{requestedAt}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('400 Bad Request', () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Unknown programme",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/programs/PRG-DOES-NOT-EXIST/reserve",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "PRG-DOES-NOT-EXIST",
+                "reserve"
+              ]
+            },
+            "description": "An unknown programme reference is a 404, not a 500.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"invoiceRef\": \"INV-{{runId}}-NOPROG\",\n  \"amount\": \"10.00\",\n  \"currency\": \"GBP\",\n  \"requestedAt\": \"{{requestedAt}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('404 Not Found', () => pm.response.to.have.status(404));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Release an unknown invoice",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$guid}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{programRef}}/release",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{programRef}}",
+                "release"
+              ]
+            },
+            "description": "Nothing to release.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"invoiceRef\": \"INV-{{runId}}-NEVER-EXISTED\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('404 Not Found', () => pm.response.to.have.status(404));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "5 · Reconciliation",
+      "item": [
+        {
+          "name": "List discrepancies (ADMIN only)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/programs/{{programRef}}/discrepancies?limit=50",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "programs",
+                "{{programRef}}",
+                "discrepancies"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "50"
+                }
+              ]
+            },
+            "description": "Where reconciliation puts anything it could not make agree with the treasury snapshot — an unknown invoice, an amount drift, a currency mismatch, or a programme left over its limit. Normally empty until a snapshot has been consumed from Kafka. ADMIN only: this is operator information, not client information."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "pm.test('returns a discrepancy list', () => pm.expect(b.discrepancies).to.be.an('array'));",
+                  "pm.test('echoes the programme', () => pm.expect(b.programRef).to.eql(pm.collectionVariables.get('programRef')));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "6 · Health",
       "item": [
         {
           "name": "Health check (no auth)",
           "request": {
-            "auth": { "type": "noauth" },
             "method": "GET",
             "header": [],
             "url": {
               "raw": "{{baseUrl}}/health",
-              "host": ["{{baseUrl}}"],
-              "path": ["health"]
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "health"
+              ]
             },
-            "description": "The one deliberately unauthenticated endpoint — a liveness probe, not a business endpoint. Everything else in this collection requires the Bearer token from '1 · Auth → Login'."
-          }
+            "description": "Liveness probe, deliberately unauthenticated because it exposes no business data. It is liveness only — it does not check Postgres or the Kafka consumer (ADR-13).",
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test(\"reports ok\", () => pm.expect(pm.response.json().status).to.eql('ok'));"
+                ]
+              }
+            }
+          ]
         }
       ]
     }

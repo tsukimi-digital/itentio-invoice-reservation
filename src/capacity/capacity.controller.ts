@@ -7,6 +7,7 @@ import { ProgramParamsDto } from './dto/program-params.dto';
 import { IdempotencyCtx } from '../idempotency/idempotency-key.decorator';
 import type { IdempotencyContext } from '../idempotency/idempotency';
 import { Roles } from '../auth/roles.decorator';
+import { UserRole } from '@prisma/client';
 
 @ApiTags('capacity')
 @ApiBearerAuth()
@@ -16,7 +17,7 @@ export class CapacityController {
 
   // Availability (GET, below) is open to any authenticated role, including
   // READER — only capacity-mutating actions are role-restricted.
-  @Roles('ADMIN', 'OPERATOR')
+  @Roles(UserRole.ADMIN, UserRole.OPERATOR)
   @Post('reserve')
   @ApiOperation({ summary: 'Reserve program capacity for an invoice' })
   reserve(
@@ -36,7 +37,7 @@ export class CapacityController {
     );
   }
 
-  @Roles('ADMIN', 'OPERATOR')
+  @Roles(UserRole.ADMIN, UserRole.OPERATOR)
   @Post('release')
   @ApiOperation({ summary: 'Release a program reservation on invoice repayment' })
   release(

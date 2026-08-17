@@ -14,14 +14,25 @@ describe('RBAC (e2e)', () => {
   let readerToken: string;
   let operatorToken: string;
   let adminToken: string;
-  // Unique per test run — fixed refs would collide with idempotency-key rows
-  // and invoices left behind by a previous run of this same spec.
-  const programRef = `PRG-RBAC-${randomUUID()}`;
+  // Unique per test run. Fixed identifiers collide with rows left behind by a
+  // previous run against the same database: not only idempotency keys and
+  // invoices, but the fixture users too — `upsert` with an empty `update`
+  // leaves an existing row's password hash in place, so a generic address like
+  // `reader@itentio.dev` created with any other password makes every login
+  // here return 401 and the whole spec fail for reasons unrelated to RBAC.
+  const runId = randomUUID();
+  const programRef = `PRG-RBAC-${runId}`;
+  const readerEmail = `rbac-reader-${runId}@itentio.dev`;
+  const operatorEmail = `rbac-operator-${runId}@itentio.dev`;
+  const adminEmail = `rbac-admin-${runId}@itentio.dev`;
 
   async function loginAs(email: string): Promise<string> {
     const res = await request(app.getHttpServer() as App)
       .post('/auth/login')
-      .send({ email, password: 'rbac-test-password' });
+      .send({ email, password: 'rbac-test-password' })
+      // Asserted, so a failed login fails here with its real status instead of
+      // handing every later request `Bearer undefined` and a confusing 401.
+      .expect(200);
     return (res.body as { accessToken: string }).accessToken;
   }
 
@@ -43,39 +54,37 @@ describe('RBAC (e2e)', () => {
     });
 
     const passwordHash = hashPassword('rbac-test-password');
-    await prisma.user.upsert({
-      where: { email: 'reader@itentio.dev' },
-      update: {},
-      create: { email: 'reader@itentio.dev', passwordHash, displayName: 'Reader', role: 'READER' },
-    });
-    await prisma.user.upsert({
-      where: { email: 'operator@itentio.dev' },
-      update: {},
-      create: {
-        email: 'operator@itentio.dev',
-        passwordHash,
-        displayName: 'Operator',
-        role: 'OPERATOR',
-      },
-    });
-    await prisma.user.upsert({
-      where: { email: 'rbac-admin@itentio.dev' },
-      update: {},
-      create: {
-        email: 'rbac-admin@itentio.dev',
-        passwordHash,
-        displayName: 'Admin',
-        role: 'ADMIN',
-      },
+    await prisma.user.createMany({
+      data: [
+        { email: readerEmail, passwordHash, displayName: 'Reader', role: 'READER' },
+        { email: operatorEmail, passwordHash, displayName: 'Operator', role: 'OPERATOR' },
+        { email: adminEmail, passwordHash, displayName: 'Admin', role: 'ADMIN' },
+      ],
     });
 
-    readerToken = await loginAs('reader@itentio.dev');
-    operatorToken = await loginAs('operator@itentio.dev');
-    adminToken = await loginAs('rbac-admin@itentio.dev');
+    readerToken = await loginAs(readerEmail);
+    operatorToken = await loginAs(operatorEmail);
+    adminToken = await loginAs(adminEmail);
   });
 
   afterAll(async () => {
-    await app.close();
+    // Fixtures are unique per run, so they would otherwise accumulate in a
+    // persistent local database. Logging in issued refresh tokens that
+    // reference these users, so those go first. `app.close()` runs in `finally`
+    // — a failed cleanup must not leave the Kafka consumer connected, which
+    // stops Jest from exiting at all.
+    try {
+      const ids = (
+        await prisma.user.findMany({
+          where: { email: { in: [readerEmail, operatorEmail, adminEmail] } },
+          select: { id: true },
+        })
+      ).map((user) => user.id);
+      await prisma.refreshToken.deleteMany({ where: { userId: { in: ids } } });
+      await prisma.user.deleteMany({ where: { id: { in: ids } } });
+    } finally {
+      await app.close();
+    }
   });
 
   it('lets a READER query availability', () => {

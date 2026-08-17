@@ -4,7 +4,13 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { Prisma } from '@prisma/client';
+import {
+  InvoiceStatus,
+  LedgerEntryType,
+  LedgerOrigin,
+  Prisma,
+  ProgramStatus,
+} from '@prisma/client';
 import { randomUUID } from 'node:crypto';
 import { PrismaService } from '../prisma/prisma.service';
 import { FxService } from '../fx/fx.service';
@@ -17,8 +23,9 @@ import {
   Tx,
 } from '../idempotency/idempotency';
 import { InsufficientCapacityException } from './exceptions';
-import { PermanentEventError } from '../common/db-errors';
+import { isTransientDbError, PermanentEventError } from '../common/db-errors';
 import { buildReleaseEvent, buildReservationEvent } from '../outbox/outbox';
+import { DELTA_DIRECTION, type DeltaDirection } from '../kafka/schemas/capacity-event.schema';
 
 export interface ReserveCommand {
   programRef: string;
@@ -45,18 +52,17 @@ const TX_OPTS = {
   maxWait: 5_000,
   timeout: 10_000,
 };
-const RETRYABLE_CODES = new Set(['40001', '40P01']);
-
+/// Contention is absorbed in-process for a few attempts before it becomes the
+/// caller's problem. Classification is shared with the Kafka consumer through
+/// `isTransientDbError`, so a lock timeout, a serialisation failure or a
+/// deadlock cannot count as retryable on one path and fatal on the other.
+/// Whatever survives all attempts is mapped to 503 by DomainExceptionFilter.
 async function withRetry<T>(fn: () => Promise<T>, max = 3): Promise<T> {
   for (let attempt = 1; ; attempt++) {
     try {
       return await fn();
     } catch (e) {
-      const code =
-        e instanceof Prisma.PrismaClientKnownRequestError
-          ? (e.meta?.code as string | undefined)
-          : undefined;
-      if (attempt >= max || !code || !RETRYABLE_CODES.has(code)) throw e;
+      if (attempt >= max || !isTransientDbError(e)) throw e;
       await new Promise((resolve) => setTimeout(resolve, Math.random() * 25 * 2 ** attempt));
     }
   }
@@ -77,8 +83,8 @@ interface GuardedUpdateRow {
   assigned_seq: bigint;
 }
 
-/// See docs/DECISIONS.md ADR-006 (pessimistic locking, FOR NO KEY UPDATE) and
-/// ADR-001/003 (money representation, FX freeze).
+/// See docs/DECISIONS.md ADR-04 (pessimistic locking, FOR NO KEY UPDATE) and
+/// ADR-02 and ADR-03 (money representation, FX freeze).
 @Injectable()
 export class CapacityService {
   constructor(
@@ -96,10 +102,10 @@ export class CapacityService {
     });
 
     // Quantise to the scale of the INVOICE's currency, not the programme's.
-    // Using the programme's scale rounded a GBP invoice to whole units for a
-    // JPY programme (1234.56 -> 1235), over-reserving capacity and writing the
-    // rounded figure into invoice.face_amount so the audit trail lied too.
-    // See docs/DECISIONS.md ADR-020.
+    // The programme's scale would round a GBP invoice to whole units against a
+    // JPY programme (1234.56 -> 1235), over-reserving capacity and persisting
+    // the rounded figure as invoice.face_amount, so the audit trail would agree
+    // with the error. See docs/DECISIONS.md ADR-02.
     const currencyCode = cmd.currency.toUpperCase();
     const invoiceCurrency = await this.prisma.currency.findUnique({
       where: { code: currencyCode },
@@ -120,10 +126,10 @@ export class CapacityService {
     }
 
     // Server time, never cmd.requestedAt. A client-supplied valuation instant
-    // let the caller pick which historical rate priced its reservation, and
-    // that rate is frozen onto the invoice and replayed at release, so the
-    // mispricing was permanent. requestedAt survives as business metadata on
-    // the ledger entry. See docs/DECISIONS.md ADR-019.
+    // would let the caller pick which historical rate prices its reservation,
+    // and that rate is frozen onto the invoice and replayed at release, so the
+    // mispricing would be permanent. requestedAt survives as business metadata
+    // on the ledger entry. See docs/DECISIONS.md ADR-03.
     const valuedAt = new Date();
     const conversion = await this.fx.convert(
       face,
@@ -148,17 +154,45 @@ export class CapacityService {
           SELECT id, currency_code, total_limit, reserved_amount, next_ledger_seq, status
             FROM program WHERE id = ${program.id}::uuid FOR NO KEY UPDATE`;
         if (!locked) throw new NotFoundException('program');
-        if (locked.status !== 'ACTIVE') throw new ConflictException('program is not ACTIVE');
+        if (locked.status !== ProgramStatus.ACTIVE) {
+          throw new ConflictException(`program is not ${ProgramStatus.ACTIVE}`);
+        }
 
         // STEP 3 — invoice, business-key idempotency (survives past the
         // Idempotency-Key header's TTL).
         let invoice = await tx.invoice.findUnique({
           where: { programId_externalRef: { programId: program.id, externalRef: cmd.invoiceRef } },
         });
-        if (invoice?.status === 'RESERVED') {
+
+        // Confirming an existing reservation is only sound for the SAME
+        // instruction. A repeat for this invoiceRef carrying a different amount
+        // or currency is a contradiction, not a replay: answering it with the
+        // stored result would return 201 and the ORIGINAL figure to a caller
+        // who asked for a different one, and that caller has every reason to
+        // believe the amount it sent was reserved.
+        if (invoice) {
+          const bookedCurrency =
+            invoice.currencyCode === currencyCode
+              ? invoiceCurrency
+              : await tx.currency.findUnique({ where: { code: invoice.currencyCode } });
+          const booked = Money.fromDb(
+            invoice.faceAmount,
+            invoice.currencyCode,
+            bookedCurrency?.minorUnits ?? invoiceCurrency.minorUnits,
+          );
+          if (!booked.eq(face)) {
+            throw new ConflictException(
+              `invoice ${cmd.invoiceRef} already exists on programme ${cmd.programRef} for ` +
+                `${booked.toString()} ${booked.currency}, but this request asks for ` +
+                `${face.toString()} ${face.currency}`,
+            );
+          }
+        }
+
+        if (invoice?.status === InvoiceStatus.RESERVED) {
           return finishIdempotent(tx, idem, this.toView(invoice, program.currency.minorUnits));
         }
-        if (invoice && invoice.status !== 'REGISTERED') {
+        if (invoice && invoice.status !== InvoiceStatus.REGISTERED) {
           throw new ConflictException(`invoice is ${invoice.status}`);
         }
         if (!invoice) {
@@ -198,8 +232,8 @@ export class CapacityService {
           data: {
             programId: program.id,
             seq: row.assigned_seq,
-            entryType: 'RESERVE',
-            origin: 'API',
+            entryType: LedgerEntryType.RESERVE,
+            origin: LedgerOrigin.API,
             deltaReserved: conversion.amount.toDecimal().toString(),
             deltaLimit: 0,
             balanceReservedAfter: row.reserved_amount,
@@ -221,7 +255,7 @@ export class CapacityService {
 
         // STEP 5b — outbox: carries this reservation's ledger seq so
         // treasury can echo it back as an acknowledgement watermark (see
-        // docs/DECISIONS.md ADR-004/005). Same transaction as the ledger
+        // docs/DECISIONS.md ADR-06). Same transaction as the ledger
         // append, so the two can never disagree.
         const outboxEvent = buildReservationEvent({
           programRef: cmd.programRef,
@@ -243,7 +277,7 @@ export class CapacityService {
         const finalInvoice = await tx.invoice.update({
           where: { id: invoice.id },
           data: {
-            status: 'RESERVED',
+            status: InvoiceStatus.RESERVED,
             reservedProgramAmount: conversion.amount.toDecimal().toString(),
             fxRateId: conversion.audit.rateId,
             fxRate: conversion.audit.effectiveRate.toString(),
@@ -291,18 +325,19 @@ export class CapacityService {
            WHERE program_id = ${program.id}::uuid AND external_ref = ${cmd.invoiceRef} FOR NO KEY UPDATE`;
         if (!invoice) throw new NotFoundException('invoice');
 
-        if (invoice.status === 'RELEASED') {
+        if (invoice.status === InvoiceStatus.RELEASED) {
           return finishIdempotent(tx, idem, {
             invoiceId: invoice.id,
             invoiceRef: cmd.invoiceRef,
-            status: 'RELEASED',
+            status: InvoiceStatus.RELEASED,
           });
         }
-        if (invoice.status !== 'RESERVED')
+        if (invoice.status !== InvoiceStatus.RESERVED) {
           throw new ConflictException(`invoice is ${invoice.status}`);
+        }
 
         // EXACTLY the amount that was reserved — never recomputed at today's
-        // rate. See docs/DECISIONS.md ADR-003: this is what makes capacity
+        // rate. See docs/DECISIONS.md ADR-03: this is what makes capacity
         // return to precisely its prior level.
         const amount = invoice.reserved_program_amount!;
 
@@ -327,8 +362,8 @@ export class CapacityService {
           data: {
             programId: program.id,
             seq: row.assigned_seq,
-            entryType: 'RELEASE',
-            origin: 'API',
+            entryType: LedgerEntryType.RELEASE,
+            origin: LedgerOrigin.API,
             deltaReserved: amount.negated().toString(),
             deltaLimit: 0,
             balanceReservedAfter: row.reserved_amount,
@@ -341,9 +376,9 @@ export class CapacityService {
         });
 
         // Same transaction as the ledger append, exactly as the reserve path
-        // does. Without this the release consumed a ledger seq that treasury
-        // never saw, which silently broke the acknowledged_local_seq watermark
-        // reconciliation depends on. See docs/DECISIONS.md ADR-022.
+        // does. Without it the release consumes a ledger seq that treasury
+        // never sees, silently breaking the acknowledged_local_seq watermark
+        // reconciliation depends on. See docs/DECISIONS.md ADR-09.
         const outboxEvent = buildReleaseEvent({
           programRef: cmd.programRef,
           invoiceRef: cmd.invoiceRef,
@@ -362,7 +397,11 @@ export class CapacityService {
 
         const finalInvoice = await tx.invoice.update({
           where: { id: invoice.id },
-          data: { status: 'RELEASED', releasedAt: new Date(), version: { increment: 1 } },
+          data: {
+            status: InvoiceStatus.RELEASED,
+            releasedAt: new Date(),
+            version: { increment: 1 },
+          },
         });
 
         return finishIdempotent(tx, idem, this.toView(finalInvoice, program.currency.minorUnits));
@@ -402,7 +441,7 @@ export class CapacityService {
       event_id: string;
       produced_at: string;
       event_seq?: bigint | null;
-      delta: { amount: string; currency: string; direction: 'RESERVE' | 'RELEASE' };
+      delta: { amount: string; currency: string; direction: DeltaDirection };
     },
   ): Promise<void> {
     const program = await tx.program.findUnique({
@@ -416,12 +455,12 @@ export class CapacityService {
     // programme's currency, so the amount must already be in that currency —
     // there is nothing else it could sensibly be. The event carries no rate,
     // and converting at one of ours would book an FX residue with no invoice
-    // to freeze it against, contradicting ADR-003.
+    // to freeze it against, contradicting ADR-03.
     //
     // So `delta.currency` is an assertion about the producer's view of the
     // world, not an instruction. A mismatch is a contract violation, and is
-    // dead-lettered rather than applied. applyBaseline has always checked this
-    // for snapshots; the delta path simply forgot. See ADR-028.
+    // dead-lettered rather than applied — the same check applyBaseline makes
+    // for snapshots. See ADR-06.
     const deltaCurrency = event.delta.currency.toUpperCase();
     if (deltaCurrency !== program.currencyCode) {
       throw new PermanentEventError(
@@ -435,10 +474,12 @@ export class CapacityService {
     if (!locked) throw new PermanentEventError(`program ${event.program_ref} vanished under lock`);
 
     const signed =
-      event.delta.direction === 'RESERVE' ? event.delta.amount : `-${event.delta.amount}`;
+      event.delta.direction === DELTA_DIRECTION.RESERVE
+        ? event.delta.amount
+        : `-${event.delta.amount}`;
     // Guarded exactly like the API path. Without the limit predicate this
-    // UPDATE walked straight into the program_no_overcommit CHECK, which the
-    // consumer then classified as transient and retried forever.
+    // UPDATE walks straight into the program_no_overcommit CHECK, which the
+    // consumer classifies as transient and would retry forever.
     const updated = await tx.$queryRaw<
       { reserved_amount: Prisma.Decimal; total_limit: Prisma.Decimal; assigned_seq: bigint }[]
     >`
@@ -461,24 +502,24 @@ export class CapacityService {
         programId: program.id,
         seq: row.assigned_seq,
         entryType: event.delta.direction,
-        origin: 'TREASURY',
+        origin: LedgerOrigin.TREASURY,
         deltaReserved: signed,
         balanceReservedAfter: row.reserved_amount,
         balanceLimitAfter: row.total_limit,
         occurredAt: new Date(event.produced_at),
         eventId: event.event_id,
-        // Treasury's own sequence for this event. Previously never written, so
-        // the column was permanently NULL and reconciliation's
+        // Treasury's own sequence for this event. Reconciliation's
         // `treasury_event_seq > included_through_event_seq` predicate — the
-        // whole TREASURY branch of the replay — could never be true. See
-        // docs/DECISIONS.md ADR-026.
+        // whole TREASURY branch of the replay — compares it against the
+        // snapshot watermark, so a NULL here leaves that branch unsatisfiable.
+        // See docs/DECISIONS.md ADR-06.
         treasuryEventSeq: event.event_seq ?? null,
       },
     });
   }
 
   /// minorUnits pins the output to the programme currency's scale (e.g.
-  /// "30.00", never "30") — see docs/DECISIONS.md ADR-002. Raw
+  /// "30.00", never "30") — see docs/DECISIONS.md ADR-02. Raw
   /// Prisma.Decimal#toString() does not preserve trailing zeros, so it must
   /// not be called directly on money fields headed for an API response.
   private toView(

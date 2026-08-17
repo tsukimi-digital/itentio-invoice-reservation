@@ -1,5 +1,6 @@
 import { INestApplication, ValidationPipe } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import type { NestExpressApplication } from '@nestjs/platform-express';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { BigIntSerializerInterceptor } from './common/bigint-serializer.interceptor';
 import { DomainExceptionFilter } from './common/domain-exception.filter';
@@ -10,13 +11,18 @@ interface ExpressLike {
   disable(key: string): void;
 }
 
+/// Largest accepted JSON body. Every DTO on this API is a handful of short
+/// fields, so the limit is declared rather than inherited from the body
+/// parser's default — a rejected body is then a deliberate 413 from
+/// DomainExceptionFilter instead of whatever the default happened to be.
+const MAX_BODY_SIZE = '64kb';
+
 /// Everything that shapes the HTTP contract lives here rather than in
 /// `bootstrap()`, because `app.useGlobalPipes`/`useGlobalFilters` are calls on
 /// the application instance — a test that builds the app through
 /// `Test.createTestingModule(...).createNestApplication()` does NOT inherit
-/// them. Before this was extracted, no e2e spec exercised ValidationPipe at
-/// all: the suite was testing a differently-configured application than the
-/// one that ships.
+/// them. A suite that skipped this call would exercise no ValidationPipe at
+/// all and test a differently-configured application than the one that ships.
 export function configureApp(app: INestApplication): void {
   const config = app.get(ConfigService<Env, true>);
   const nodeEnv = config.get('NODE_ENV', { infer: true });
@@ -30,6 +36,8 @@ export function configureApp(app: INestApplication): void {
   // is the safe choice; deployments behind a proxy set the real hop count.
   httpAdapter.set('trust proxy', config.get('TRUST_PROXY_HOPS', { infer: true }));
   httpAdapter.disable('x-powered-by');
+
+  (app as NestExpressApplication).useBodyParser('json', { limit: MAX_BODY_SIZE });
 
   app.useGlobalPipes(
     new ValidationPipe({

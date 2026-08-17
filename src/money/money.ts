@@ -8,7 +8,7 @@ export class CurrencyMismatchError extends Error {
 }
 
 /// Immutable. Always quantised to its currency's minor units on construction,
-/// so an invalid amount can never exist. See docs/DECISIONS.md ADR-001/002.
+/// so an invalid amount can never exist. See docs/DECISIONS.md ADR-02.
 export class Money {
   private constructor(
     private readonly value: Dec,

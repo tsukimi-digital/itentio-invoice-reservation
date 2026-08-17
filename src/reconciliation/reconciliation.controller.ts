@@ -3,16 +3,14 @@ import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { PrismaService } from '../prisma/prisma.service';
 import { Roles } from '../auth/roles.decorator';
 import { ProgramParamsDto } from '../capacity/dto/program-params.dto';
-import { ListDiscrepanciesDto } from './dto/list-discrepancies.dto';
+import { UserRole } from '@prisma/client';
+import { DEFAULT_DISCREPANCY_LIMIT, ListDiscrepanciesDto } from './dto/list-discrepancies.dto';
 
-const DEFAULT_LIMIT = 50;
-
-/// ADR-011 says a programme that ends up over its limit after reconciliation
-/// is left "visible and auditable rather than hidden". It was neither: the
-/// `reconciliation_discrepancy` table was written by the worker and read by
-/// nothing — no endpoint, no log, no alert — so "auditable" meant "open a
-/// psql session". This endpoint, plus the warn-level log the worker now
-/// emits, is what makes that ADR true.
+/// ADR-07 leaves a programme that ends up over its limit after reconciliation
+/// "visible and auditable rather than hidden". A `reconciliation_discrepancy`
+/// row read by nothing would make "auditable" mean "open a psql session", so
+/// this endpoint — together with the warn-level log the worker emits — is
+/// what carries that guarantee.
 ///
 /// ADMIN-only: discrepancies expose reconciliation internals and cross-system
 /// disagreement, which is operator information, not client information.
@@ -22,7 +20,7 @@ const DEFAULT_LIMIT = 50;
 export class ReconciliationController {
   constructor(private readonly prisma: PrismaService) {}
 
-  @Roles('ADMIN')
+  @Roles(UserRole.ADMIN)
   @Get('discrepancies')
   @ApiOperation({ summary: 'Reconciliation discrepancies recorded for a program (newest first)' })
   async list(@Param() params: ProgramParamsDto, @Query() query: ListDiscrepanciesDto) {
@@ -35,7 +33,7 @@ export class ReconciliationController {
     const rows = await this.prisma.reconciliationDiscrepancy.findMany({
       where: { programId: program.id },
       orderBy: { createdAt: 'desc' },
-      take: query.limit ?? DEFAULT_LIMIT,
+      take: query.limit ?? DEFAULT_DISCREPANCY_LIMIT,
     });
 
     const minorUnits = program.currency.minorUnits;
@@ -45,7 +43,7 @@ export class ReconciliationController {
       // Amounts are formatted here rather than handed over as Prisma.Decimal:
       // the global BigInt interceptor walks response objects with
       // Object.entries and would serialise a Decimal as its internals
-      // ({"s":1,"e":2,"d":[...]}), bypassing toJSON. ADR-001's rule — money
+      // ({"s":1,"e":2,"d":[...]}), bypassing toJSON. ADR-02's rule — money
       // leaves as a fixed-scale string, never a number — is enforced at the
       // boundary.
       discrepancies: rows.map((row) => ({

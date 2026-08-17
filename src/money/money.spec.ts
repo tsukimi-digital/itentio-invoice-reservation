@@ -8,12 +8,11 @@ describe('Money', () => {
     expect(m.toString()).toBe('18.24');
   });
 
-  // ADR-010 commits to ROUND_HALF_EVEN (banker's rounding) so that ties do not
+  // ADR-02 commits to ROUND_HALF_EVEN (banker's rounding) so that ties do not
   // drift systematically in one direction across a large reservation volume.
-  // Nothing tested that claim: every existing assertion used a non-tie value
-  // or a rate chosen to land exactly on a representable figure, so the suite
-  // would have stayed green under HALF_UP. These two cases are ties, and both
-  // fail under HALF_UP (which gives 18.24 and 18.25 respectively).
+  // Only exact ties can pin that down: assertions on non-tie values, or on
+  // rates landing exactly on a representable figure, stay green under HALF_UP
+  // too. These cases are ties, and fail under HALF_UP (18.24 and 18.25).
   describe('ROUND_HALF_EVEN on exact ties', () => {
     it('rounds a tie up when that reaches an even last digit', () => {
       expect(Money.of('18.235', 'GBP', 2).toString()).toBe('18.24');

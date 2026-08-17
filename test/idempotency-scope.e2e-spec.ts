@@ -8,13 +8,14 @@ import { configureApp } from '../src/bootstrap';
 import { PrismaService } from '../src/prisma/prisma.service';
 import { hashPassword } from '../src/auth/password';
 
-/// The idempotency fingerprint used to cover the request BODY only. Since
-/// `programRef` is a path parameter, two reservations against different
-/// programmes carried byte-identical bodies — so the second call replayed the
-/// first programme's response (HTTP 201, wrong invoiceId) and the second
-/// programme was never debited, with the caller none the wiser.
+/// The idempotency fingerprint covers the method and concrete URL, not the
+/// request BODY alone. `programRef` is a path parameter, so two reservations
+/// against different programmes carry byte-identical bodies: on a body-only
+/// fingerprint the second call replays the first programme's response
+/// (HTTP 201, wrong invoiceId) and the second programme is never debited,
+/// with the caller none the wiser.
 ///
-/// See docs/DECISIONS.md ADR-021.
+/// See docs/DECISIONS.md ADR-08.
 describe('Idempotency-Key scope (e2e)', () => {
   let app: INestApplication;
   let prisma: PrismaService;
@@ -83,9 +84,9 @@ describe('Idempotency-Key scope (e2e)', () => {
 
     const first = await reserve(programA, key, body).expect(201);
 
-    // Same key, same body, different programme. Previously: 201 replaying
-    // programme A's payload. Now: a conflict, because the fingerprint covers
-    // the method and the concrete URL.
+    // Same key, same body, different programme: a conflict rather than a 201
+    // replaying programme A's payload, because the fingerprint covers the
+    // method and the concrete URL.
     const second = await reserve(programB, key, body).expect(409);
     expect(second.body).not.toEqual(first.body);
 

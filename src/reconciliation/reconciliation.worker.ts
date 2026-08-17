@@ -1,5 +1,11 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
-import { Prisma, ReconciliationStatus } from '@prisma/client';
+import {
+  InvoiceStatus,
+  LedgerEntryType,
+  LedgerOrigin,
+  Prisma,
+  ReconciliationStatus,
+} from '@prisma/client';
 import { randomUUID } from 'node:crypto';
 import { PrismaService } from '../prisma/prisma.service';
 import { Dec } from '../money/decimal';
@@ -7,18 +13,42 @@ import { Dec } from '../money/decimal';
 const TICK_INTERVAL_MS = 2_000;
 const CHUNK = 500;
 
+/// The two phases a job can be resumed at. `applyBaseline` stamps program_id in
+/// the same transaction that sets BASELINE_APPLIED, so a re-claimed job can
+/// tell which one it died in from durable state alone.
+const JOB_PHASE = { BASELINE: 'BASELINE', POSITIONS: 'POSITIONS' } as const;
+type JobPhase = (typeof JOB_PHASE)[keyof typeof JOB_PHASE];
+
+/// Baseline and position sync each run in one transaction that can span many
+/// statements, so they need a longer budget than the default.
+const JOB_TX_TIMEOUT_MS = 15_000;
+
+/// `reconciliation_discrepancy.kind` is free text in the schema, so the
+/// vocabulary is pinned here — an operator filtering on these values needs
+/// them to be stable, and a typo would silently create a new category.
+const DISCREPANCY_KIND = {
+  OVER_LIMIT_AFTER_BASELINE: 'OVER_LIMIT_AFTER_BASELINE',
+  UNKNOWN_INVOICE: 'UNKNOWN_INVOICE',
+  CURRENCY_MISMATCH: 'CURRENCY_MISMATCH',
+  AMOUNT_DRIFT: 'AMOUNT_DRIFT',
+} as const;
+
+/// Recorded on the baseline entry so the choice between the watermark and the
+/// time-window fallback is auditable after the fact.
+const REPLAY_STRATEGY = { WATERMARK: 'watermark', TIME_FALLBACK: 'time-fallback' } as const;
+
 /// A CLAIMED job whose worker has not touched it for this long is assumed
 /// dead and may be re-claimed. `claimNextJob` commits status = CLAIMED and
-/// then releases the row lock, so a SIGKILL mid-`applyBaseline` used to leave
-/// the job in a state that matched no selector — invisible to every worker,
-/// forever. See docs/DECISIONS.md ADR-029.
+/// then releases the row lock, so without a lease a SIGKILL mid-`applyBaseline`
+/// leaves the job in a state that matches no selector — invisible to every
+/// worker, forever. See docs/DECISIONS.md ADR-10.
 const CLAIM_LEASE_MS = 5 * 60 * 1000;
 
 /// Attempts before a job stops being retried and waits for a human.
 const MAX_JOB_ATTEMPTS = 5;
 
 /// Clock-skew allowance for the time-based replay fallback. Treasury's `as_of`
-/// and our `occurred_at` come from different clocks, and ADR-004/005 commits
+/// and our `occurred_at` come from different clocks, and ADR-06 commits
 /// to erring towards over-replay: over-replaying understates available
 /// capacity (a recoverable false rejection), under-replaying overstates it
 /// (a real overcommit).
@@ -64,11 +94,11 @@ interface ClaimedJob {
   header: Prisma.JsonValue;
   attempts: number;
   positionCursor: string | null;
-  phase: 'BASELINE' | 'POSITIONS';
+  phase: JobPhase;
 }
 
-/// See docs/DECISIONS.md ADR-004/005 (baseline+replay, bidirectional
-/// acknowledgement watermark) and ADR-011 (overcommit after reconciliation
+/// See docs/DECISIONS.md ADR-06 (baseline+replay, bidirectional
+/// acknowledgement watermark) and ADR-07 (overcommit after reconciliation
 /// is flagged, never clamped).
 @Injectable()
 export class ReconciliationWorker implements OnModuleInit, OnModuleDestroy {
@@ -95,7 +125,7 @@ export class ReconciliationWorker implements OnModuleInit, OnModuleDestroy {
 
   /// Re-entrancy guard. `syncPositions` runs outside any transaction across
   /// many chunks; for a large snapshot that takes far longer than the tick
-  /// interval, and the next tick used to re-claim the very same job and run a
+  /// interval, so an unguarded tick re-claims the very same job and runs a
   /// second position sync concurrently — duplicating discrepancy rows and
   /// letting `positionCursor` move backwards. On one instance.
   private async tick(): Promise<void> {
@@ -115,13 +145,16 @@ export class ReconciliationWorker implements OnModuleInit, OnModuleDestroy {
     const job = await this.claimNextJob();
     if (!job) return;
     try {
-      if (job.phase === 'BASELINE') {
+      if (job.phase === JOB_PHASE.BASELINE) {
         await this.applyBaseline(job);
       }
       const refreshed = await this.prisma.reconciliationJob.findUniqueOrThrow({
         where: { id: job.id },
       });
-      if (refreshed.status === 'BASELINE_APPLIED' || job.phase === 'POSITIONS') {
+      if (
+        refreshed.status === ReconciliationStatus.BASELINE_APPLIED ||
+        job.phase === JOB_PHASE.POSITIONS
+      ) {
         await this.syncPositions({
           id: refreshed.id,
           programId: refreshed.programId,
@@ -136,10 +169,10 @@ export class ReconciliationWorker implements OnModuleInit, OnModuleDestroy {
   /// Returns a job to the queue with a backoff, or parks it as FAILED once
   /// attempts are exhausted.
   ///
-  /// Previously any throw set FAILED terminally, and FAILED matched no
-  /// selector — so a single `SET LOCAL lock_timeout` trip, caused by a long
-  /// reservation holding the programme row, permanently abandoned that
-  /// programme's snapshot with nothing alerting on it.
+  /// FAILED matches no selector and is therefore terminal, so it must be
+  /// reserved for exhaustion: a single `SET LOCAL lock_timeout` trip, caused by
+  /// a long reservation holding the programme row, would otherwise abandon that
+  /// programme's snapshot permanently with nothing alerting on it.
   private async requeueOrFail(job: ClaimedJob, err: unknown): Promise<void> {
     const reason = err instanceof Error ? err.message : String(err);
 
@@ -180,21 +213,24 @@ export class ReconciliationWorker implements OnModuleInit, OnModuleDestroy {
 
   /// Claims the next eligible job, including one abandoned by a dead worker.
   ///
-  /// `chunks_received >= chunk_count`, not `=`: a producer that resends a
-  /// chunk under a fresh event_id pushes the counter past the total, and
-  /// equality then never held again, leaving a complete snapshot parked
-  /// forever. `>=` degrades to "may run with a duplicate chunk counted",
-  /// which costs only per-invoice attribution — the capacity figure itself
-  /// comes from the snapshot header, not from the positions.
+  /// Completeness is the number of DISTINCT chunk indexes received, so a chunk
+  /// redelivered under a fresh event_id cannot stand in for one that never
+  /// arrived. `>=` rather than `=` because a producer may legitimately declare
+  /// fewer chunks than it sends; equality would then never hold again and park
+  /// a complete snapshot forever.
   private async claimNextJob(): Promise<ClaimedJob | null> {
     return this.prisma.$transaction(async (tx) => {
       const leaseCutoff = new Date(Date.now() - CLAIM_LEASE_MS);
       const [row] = await tx.$queryRaw<{ id: string; status: string; program_id: string | null }[]>`
         SELECT id, status, program_id FROM reconciliation_job
-         WHERE chunks_received >= chunk_count
+         WHERE cardinality(received_chunks) >= chunk_count
            AND (
-                 (status IN ('PENDING', 'BASELINE_APPLIED') AND available_at <= now())
-              OR (status = 'CLAIMED' AND claimed_at IS NOT NULL AND claimed_at < ${leaseCutoff})
+                 (status IN (
+                    ${ReconciliationStatus.PENDING}::"ReconciliationStatus",
+                    ${ReconciliationStatus.BASELINE_APPLIED}::"ReconciliationStatus"
+                  ) AND available_at <= now())
+              OR (status = ${ReconciliationStatus.CLAIMED}::"ReconciliationStatus"
+                  AND claimed_at IS NOT NULL AND claimed_at < ${leaseCutoff})
            )
          ORDER BY snapshot_seq LIMIT 1 FOR UPDATE SKIP LOCKED
       `;
@@ -212,12 +248,13 @@ export class ReconciliationWorker implements OnModuleInit, OnModuleDestroy {
 
       // A re-claimed CLAIMED job carries no record of which phase it died in,
       // so derive it the same way requeueOrFail does.
-      const priorPhase: ClaimedJob['phase'] =
-        row.status === 'BASELINE_APPLIED' || (row.status === 'CLAIMED' && row.program_id !== null)
-          ? 'POSITIONS'
-          : 'BASELINE';
+      const priorPhase: JobPhase =
+        row.status === ReconciliationStatus.BASELINE_APPLIED ||
+        (row.status === ReconciliationStatus.CLAIMED && row.program_id !== null)
+          ? JOB_PHASE.POSITIONS
+          : JOB_PHASE.BASELINE;
 
-      if (row.status === 'CLAIMED') {
+      if (row.status === ReconciliationStatus.CLAIMED) {
         this.logger.warn(
           `Re-claiming job ${row.id} abandoned by a previous worker; resuming at ${priorPhase}`,
         );
@@ -280,10 +317,11 @@ export class ReconciliationWorker implements OnModuleInit, OnModuleDestroy {
         const includedKnown = header.included_through_event_seq !== null;
         const ackSeq = ackKnown ? BigInt(header.acknowledged_local_seq!) : 0n;
         const includedSeq = includedKnown ? BigInt(header.included_through_event_seq!) : 0n;
-        // ADR-004/005 promised this fallback and never implemented it: a
-        // missing watermark used to mean ackSeq = 0, i.e. replay every API
-        // entry ever recorded, which double-counts the entire history into a
-        // snapshot that already contains it and can freeze the programme.
+        // Fallback when the snapshot carries no watermark (ADR-06). Treating an
+        // absent watermark as ackSeq = 0 would replay every API entry ever
+        // recorded, double-counting the entire history into a snapshot that
+        // already contains it and freezing the programme, so the replay is
+        // bounded by a time window instead.
         const timeCutoff = new Date(job.asOf.getTime() - REPLAY_SKEW_MS);
 
         const [agg] = await tx.$queryRaw<{ sum_delta: Prisma.Decimal; hi: bigint; n: bigint }[]>`
@@ -297,9 +335,9 @@ export class ReconciliationWorker implements OnModuleInit, OnModuleDestroy {
                    END
                  WHEN origin = 'TREASURY' THEN
                    -- treasury_event_seq IS NULL means "we cannot tell whether
-                   -- treasury folded this in". It was ALWAYS null before
-                   -- ADR-026, so this branch never matched and every treasury
-                   -- delta was silently erased by the baseline.
+                   -- treasury folded this in" (ADR-06). Such an entry falls
+                   -- back to the time window rather than failing the sequence
+                   -- test, which would silently erase it from the baseline.
                    CASE WHEN ${includedKnown}::boolean AND treasury_event_seq IS NOT NULL
                         THEN treasury_event_seq > ${includedSeq}
                         ELSE occurred_at > ${timeCutoff}
@@ -341,7 +379,7 @@ export class ReconciliationWorker implements OnModuleInit, OnModuleDestroy {
             jobId: job.id,
             programId: p.id,
             programRef: job.programRef,
-            kind: 'OVER_LIMIT_AFTER_BASELINE',
+            kind: DISCREPANCY_KIND.OVER_LIMIT_AFTER_BASELINE,
             expected: treasuryLimit.toString(),
             actual: newReserved.toString(),
             detail: { note: 'treasury limit below reserved capacity; flagged, not clamped' },
@@ -352,8 +390,8 @@ export class ReconciliationWorker implements OnModuleInit, OnModuleDestroy {
           data: {
             programId: p.id,
             seq: applied[0].assigned_seq,
-            entryType: 'RECONCILE_BASELINE',
-            origin: 'RECONCILIATION',
+            entryType: LedgerEntryType.RECONCILE_BASELINE,
+            origin: LedgerOrigin.RECONCILIATION,
             deltaReserved: baselineDelta.toString(),
             deltaLimit: treasuryLimit.minus(p.total_limit.toString()).toString(),
             balanceReservedAfter: newReserved.toString(),
@@ -370,7 +408,7 @@ export class ReconciliationWorker implements OnModuleInit, OnModuleDestroy {
               replayedThroughSeq: agg.hi.toString(),
               acknowledgedLocalSeq: ackKnown ? ackSeq.toString() : null,
               includedThroughEventSeq: includedKnown ? includedSeq.toString() : null,
-              replayStrategy: ackKnown ? 'watermark' : 'time-fallback',
+              replayStrategy: ackKnown ? REPLAY_STRATEGY.WATERMARK : REPLAY_STRATEGY.TIME_FALLBACK,
               replayTimeCutoff: ackKnown ? null : timeCutoff.toISOString(),
             },
           },
@@ -384,7 +422,10 @@ export class ReconciliationWorker implements OnModuleInit, OnModuleDestroy {
           data: { status: ReconciliationStatus.BASELINE_APPLIED, programId: p.id },
         });
       },
-      { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted, timeout: 15_000 },
+      {
+        isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted,
+        timeout: JOB_TX_TIMEOUT_MS,
+      },
     );
   }
 
@@ -415,12 +456,11 @@ export class ReconciliationWorker implements OnModuleInit, OnModuleDestroy {
 
           for (const pos of page) {
             // Scoped to the programme. invoice.external_ref is unique only per
-            // programme, so an unscoped findFirst matched an arbitrary
-            // same-ref invoice belonging to a DIFFERENT programme — raising a
-            // drift alert against the wrong figures and leaking another
-            // programme's amounts into this one's discrepancy record. That
-            // record is now readable over HTTP, which turns the old bug into a
-            // cross-programme disclosure. See docs/DECISIONS.md ADR-030.
+            // programme, so an unscoped lookup can match a same-ref invoice
+            // belonging to a DIFFERENT programme — raising a drift alert
+            // against the wrong figures and copying another programme's
+            // amounts into this one's discrepancy record, which is readable
+            // over HTTP. See docs/DECISIONS.md ADR-06.
             const invoice = await tx.invoice.findUnique({
               where: { programId_externalRef: { programId, externalRef: pos.invoiceRef } },
             });
@@ -428,7 +468,7 @@ export class ReconciliationWorker implements OnModuleInit, OnModuleDestroy {
               await this.recordDiscrepancy(tx, {
                 jobId: job.id,
                 programId,
-                kind: 'UNKNOWN_INVOICE',
+                kind: DISCREPANCY_KIND.UNKNOWN_INVOICE,
                 invoiceRef: pos.invoiceRef,
                 detail: { snapshotAmount: pos.reservedAmount.toString() },
               });
@@ -440,7 +480,7 @@ export class ReconciliationWorker implements OnModuleInit, OnModuleDestroy {
               await this.recordDiscrepancy(tx, {
                 jobId: job.id,
                 programId,
-                kind: 'CURRENCY_MISMATCH',
+                kind: DISCREPANCY_KIND.CURRENCY_MISMATCH,
                 invoiceRef: pos.invoiceRef,
                 detail: {
                   snapshotCurrency: pos.currencyCode,
@@ -450,15 +490,15 @@ export class ReconciliationWorker implements OnModuleInit, OnModuleDestroy {
               continue;
             }
             if (
-              invoice.status === 'RESERVED' &&
-              // Decimal comparison, not string comparison: ADR-001 itself warns
+              invoice.status === InvoiceStatus.RESERVED &&
+              // Decimal comparison, not string comparison: ADR-02 itself warns
               // that toString() does not preserve trailing zeros.
               !(invoice.reservedProgramAmount?.equals(pos.reservedAmount) ?? false)
             ) {
               await this.recordDiscrepancy(tx, {
                 jobId: job.id,
                 programId,
-                kind: 'AMOUNT_DRIFT',
+                kind: DISCREPANCY_KIND.AMOUNT_DRIFT,
                 invoiceRef: pos.invoiceRef,
                 expected: pos.reservedAmount,
                 actual: invoice.reservedProgramAmount,
@@ -474,7 +514,7 @@ export class ReconciliationWorker implements OnModuleInit, OnModuleDestroy {
           });
           return page.length < CHUNK;
         },
-        { timeout: 15_000 },
+        { timeout: JOB_TX_TIMEOUT_MS },
       );
 
       if (done) break;
@@ -486,10 +526,9 @@ export class ReconciliationWorker implements OnModuleInit, OnModuleDestroy {
     });
   }
 
-  /// Discrepancies used to be written and read by absolutely nothing — no
-  /// endpoint, no log, no alert — while ADR-011 claimed they were "visible and
-  /// auditable". They are now queryable (ReconciliationController) and every
-  /// one of them announces itself in the log.
+  /// A discrepancy is only "visible and auditable" (ADR-07) if it reaches an
+  /// operator, so each one is logged at `warn` as it is recorded as well as
+  /// being queryable over HTTP via ReconciliationController.
   private async recordDiscrepancy(
     tx: Prisma.TransactionClient,
     input: {
