@@ -152,6 +152,44 @@ the original response unchanged rather than double-reserving — the header is a
 latency optimisation; the underlying guarantee is a business-key uniqueness
 constraint on `(programId, invoiceRef)`.
 
+### Testing the Kafka side by hand
+
+There's no HTTP surface for the treasury feed — it's a real Kafka topic. To
+push a delta into it directly (`kafkajs` is already a dependency, so no extra
+install):
+
+```bash
+node -e '
+const { Kafka } = require("kafkajs");
+(async () => {
+  const kafka = new Kafka({ clientId: "manual-test", brokers: ["localhost:9092"] });
+  const producer = kafka.producer();
+  await producer.connect();
+  await producer.send({
+    topic: "treasury.capacity-events",
+    messages: [{
+      key: "PRG-1",
+      value: JSON.stringify({
+        event_id: crypto.randomUUID(),
+        event_type: "program.capacity.delta",
+        schema_version: 1,
+        produced_at: new Date().toISOString(),
+        program_ref: "PRG-1",
+        event_seq: 1,
+        delta: { amount: "500.00", currency: "GBP", direction: "RESERVE" },
+      }),
+    }],
+  });
+  await producer.disconnect();
+})();
+'
+```
+
+`GET /programs/PRG-1` should reflect the delta within a second or two. The
+full wire contract (deltas and bulk snapshots alike) is
+[`src/kafka/schemas/capacity-event.schema.ts`](src/kafka/schemas/capacity-event.schema.ts).
+
+
 ## Development
 
 ```bash
