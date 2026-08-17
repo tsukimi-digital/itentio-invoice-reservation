@@ -1,29 +1,20 @@
-import { ValidationPipe } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { NestFactory } from '@nestjs/core';
-import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
+import { Logger } from '@nestjs/common';
 import { AppModule } from './app.module';
+import { configureApp } from './bootstrap';
 import type { Env } from './config/env.schema';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
+  // Without this, onModuleDestroy (Kafka consumer/producer disconnect, the
+  // reconciliation worker's interval) only runs on an explicit app.close()
+  // call — a real SIGTERM (container restart) would not trigger it, leaving
+  // the consumer to time out of its group instead of leaving cleanly.
+  app.enableShutdownHooks();
 
-  app.useGlobalPipes(
-    new ValidationPipe({
-      whitelist: true,
-      forbidNonWhitelisted: true,
-      transform: true,
-    }),
-  );
-
-  const config = new DocumentBuilder()
-    .setTitle('Program Capacity & Invoice Reservation')
-    .setDescription('Tracks program credit capacity and invoice reservations in real time')
-    .setVersion('0.1.0')
-    .addBearerAuth()
-    .build();
-  const document = SwaggerModule.createDocument(app, config);
-  SwaggerModule.setup('docs', app, document);
+  // Shared with the e2e suite — see configureApp's doc comment.
+  configureApp(app);
 
   const configService = app.get(ConfigService<Env, true>);
   const port = configService.get('PORT', { infer: true });
@@ -32,6 +23,9 @@ async function bootstrap() {
 }
 
 bootstrap().catch((error: unknown) => {
-  console.error('Failed to start application', error);
+  new Logger('Bootstrap').error(
+    `Failed to start application: ${String(error)}`,
+    error instanceof Error ? error.stack : undefined,
+  );
   process.exit(1);
 });
