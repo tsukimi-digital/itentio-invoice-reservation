@@ -1,5 +1,5 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
-import { Kafka, Producer } from 'kafkajs';
+import { Kafka, Partitioners, Producer } from 'kafkajs';
 import { ConfigService } from '@nestjs/config';
 import { OutboxStatus, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
@@ -48,7 +48,13 @@ export class OutboxRelayService implements OnModuleInit, OnModuleDestroy {
       clientId: this.config.get('KAFKA_CLIENT_ID', { infer: true }),
       brokers: this.config.get('KAFKA_BROKERS', { infer: true }),
     });
-    this.producer = kafka.producer({ idempotent: true });
+    // Partitioner choice is moot: every topic here is single-partition, so
+    // this only pins the pre-v2 kafkajs default to silence its startup
+    // warning rather than leaving the choice implicit.
+    this.producer = kafka.producer({
+      idempotent: true,
+      createPartitioner: Partitioners.LegacyPartitioner,
+    });
 
     // Connect lazily and never at boot: a rejection from onModuleInit aborts
     // NestFactory.create and takes the whole HTTP API down with it — even
